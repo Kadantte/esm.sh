@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -14,19 +15,26 @@ import (
 	"github.com/ije/gox/utils"
 )
 
-var internalNodeModules = map[string]bool{
+const (
+	nodejsMinVersion = 22
+	nodeTypesVersion = "20.14.4"
+	pnpmMinVersion   = "9.0.0"
+)
+
+var nodejsInternalModules = map[string]bool{
 	"assert":              true,
 	"assert/strict":       true,
 	"async_hooks":         true,
+	"buffer":              true,
 	"child_process":       true,
 	"cluster":             true,
-	"buffer":              true,
 	"console":             true,
 	"constants":           true,
 	"crypto":              true,
 	"dgram":               true,
 	"diagnostics_channel": true,
 	"dns":                 true,
+	"dns/promises":        true,
 	"domain":              true,
 	"events":              true,
 	"fs":                  true,
@@ -48,6 +56,7 @@ var internalNodeModules = map[string]bool{
 	"readline":            true,
 	"repl":                true,
 	"stream":              true,
+	"stream/consumers":    true,
 	"stream/promises":     true,
 	"stream/web":          true,
 	"string_decoder":      true,
@@ -68,83 +77,54 @@ var internalNodeModules = map[string]bool{
 	"zlib":                true,
 }
 
-// copy from https://github.com/webpack/webpack/blob/master/lib/ModuleNotFoundError.js#L13
-var polyfilledInternalNodeModules = map[string]string{
-	"assert":         "assert@2.1.0",
-	"buffer":         "buffer@6.0.3",
-	"console":        "console-browserify@1.2.0",
-	"constants":      "constants-browserify@1.0.0",
-	"crypto":         "crypto-browserify@3.12.0",
-	"domain":         "domain-browser@5.2.0",
-	"http":           "stream-http@3.2.0",
-	"https":          "https-browserify@1.0.0",
-	"os":             "os-browserify@0.3.0/browser",
-	"path":           "path-browserify@1.0.1",
-	"punycode":       "punycode@2.3.1",
-	"querystring":    "querystring-es3@0.2.1",
-	"stream":         "stream-browserify@3.0.0",
-	"stream/web":     "web-streams-polyfill@3.2.1",
-	"string_decoder": "string_decoder@1.3.0",
-	"sys":            "util@0.12.5",
-	"timers":         "timers-browserify@2.0.12",
-	"tty":            "tty-browserify@0.0.1",
-	"url":            "url@0.11.3",
-	"util":           "util@0.12.5",
-	"vm":             "vm-browserify@1.1.2",
-	"zlib":           "browserify-zlib@0.2.0",
-}
+func checkNodejs(installDir string) (nodeVersion string, pnpmVersion string, err error) {
+	nodeVersion, major, err := getNodejsVersion()
+	useSystemNodejs := err == nil && major >= nodejsMinVersion
 
-func checkNodejs(installDir string) (nodeVer string, pnpmVer string, err error) {
-	var installed bool
-CheckNodejs:
-	nodeVer, major, err := getNodejsVersion()
-	if err != nil || major < nodejsMinVersion {
+	if !useSystemNodejs {
 		PATH := os.Getenv("PATH")
 		nodeBinDir := path.Join(installDir, "bin")
 		if !strings.Contains(PATH, nodeBinDir) {
 			os.Setenv("PATH", fmt.Sprintf("%s%c%s", nodeBinDir, os.PathListSeparator, PATH))
-			goto CheckNodejs
-		} else if !installed {
-			err = os.RemoveAll(installDir)
-			if err != nil {
-				return
-			}
-			err = installNodejs(installDir, nodejsLatestLTS)
-			if err != nil {
-				return
-			}
-			log.Infof("nodejs %s installed", nodejsLatestLTS)
-			installed = true
-			goto CheckNodejs
-		} else {
-			if err == nil {
-				err = fmt.Errorf("bad nodejs version %s need %d+", nodeVer, nodejsMinVersion)
-			}
-			return
 		}
+		nodeVersion, major, err = getNodejsVersion()
+		if err != nil || major < nodejsMinVersion {
+			var latestVersion string
+			latestVersion, err = getNodejsLatestVersion()
+			if err != nil {
+				return
+			}
+			err = installNodejs(installDir, latestVersion)
+			if err != nil {
+				return
+			}
+			log.Infof("nodejs %s installed", latestVersion)
+		}
+		nodeVersion, major, err = getNodejsVersion()
+	}
+	if err == nil && major < nodejsMinVersion {
+		err = fmt.Errorf("bad nodejs version %s need %d+", nodeVersion, nodejsMinVersion)
+	}
+	if err != nil {
+		return
 	}
 
-CheckPnpm:
-	output, err := exec.Command("pnpm", "-v").CombinedOutput()
-	if err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			output, err = exec.Command("npm", "install", "pnpm", "-g").CombinedOutput()
-			if err != nil {
-				err = fmt.Errorf("install pnpm: %s", strings.TrimSpace(string(output)))
-				return
-			}
-			goto CheckPnpm
+	pnpmOutput, err := run("pnpm", "-v")
+	if (err != nil && errors.Is(err, exec.ErrNotFound)) || (err == nil && semverLessThan(strings.TrimSpace(string(pnpmOutput)), pnpmMinVersion)) {
+		_, err = run("npm", "install", "pnpm", "-g")
+		if err != nil {
+			return
 		}
-		err = fmt.Errorf("bad pnpm version: %s", strings.TrimSpace(string(output)))
+		pnpmOutput, err = run("pnpm", "-v")
 	}
 	if err == nil {
-		pnpmVer = strings.TrimSpace(string(output))
+		pnpmVersion = strings.TrimSpace(string(pnpmOutput))
 	}
 	return
 }
 
 func getNodejsVersion() (version string, major int, err error) {
-	output, err := exec.Command("node", "--version").CombinedOutput()
+	output, err := run("node", "--version")
 	if err != nil {
 		return
 	}
@@ -155,7 +135,28 @@ func getNodejsVersion() (version string, major int, err error) {
 	return
 }
 
-func installNodejs(dir string, version string) (err error) {
+func getNodejsLatestVersion() (verison string, err error) {
+	var res *http.Response
+	res, err = http.Get(fmt.Sprintf("https://nodejs.org/download/release/latest-v%d.x/", nodejsMinVersion))
+	if err != nil {
+		return
+	}
+	defer res.Body.Close()
+	var body []byte
+	body, err = io.ReadAll(res.Body)
+	if err != nil {
+		return
+	}
+	i := strings.Index(string(body), fmt.Sprintf("node-v%d.", nodejsMinVersion))
+	if i < 0 {
+		err = fmt.Errorf("no nodejs version found")
+		return
+	}
+	verison, _ = utils.SplitByFirstByte(string(body[i+5:]), '-')
+	return
+}
+
+func installNodejs(installDir string, version string) (err error) {
 	arch := runtime.GOARCH
 	switch arch {
 	case "amd64":
@@ -163,8 +164,8 @@ func installNodejs(dir string, version string) (err error) {
 	case "386":
 		arch = "x86"
 	}
-	dlURL := fmt.Sprintf("https://nodejs.org/dist/v%s/node-v%s-%s-%s.tar.xz", version, version, runtime.GOOS, arch)
-	resp, err := fetch(dlURL)
+	dlURL := fmt.Sprintf("https://nodejs.org/dist/%s/node-%s-%s-%s.tar.xz", version, version, runtime.GOOS, arch)
+	resp, err := http.Get(dlURL)
 	if err != nil {
 		err = fmt.Errorf("download nodejs: %v", err)
 		return
@@ -181,21 +182,16 @@ func installNodejs(dir string, version string) (err error) {
 
 	cmd := exec.Command("tar", "-xJf", path.Base(dlURL))
 	cmd.Dir = os.TempDir()
-	output, err := cmd.CombinedOutput()
+	err = cmd.Run()
 	if err != nil {
-		if len(output) > 0 {
-			err = errors.New(string(output))
-		}
 		return
 	}
 
-	cmd = exec.Command("mv", "-f", strings.TrimSuffix(path.Base(dlURL), ".tar.xz"), dir)
+	// remove old installation if exists
+	os.RemoveAll(installDir)
+
+	cmd = exec.Command("mv", "-f", strings.TrimSuffix(path.Base(dlURL), ".tar.xz"), installDir)
 	cmd.Dir = os.TempDir()
-	output, err = cmd.CombinedOutput()
-	if err != nil {
-		if len(output) > 0 {
-			err = errors.New(string(output))
-		}
-	}
+	err = cmd.Run()
 	return
 }

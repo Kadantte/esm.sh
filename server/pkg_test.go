@@ -6,7 +6,7 @@ import (
 )
 
 func TestPackageJsonParse(t *testing.T) {
-	var info NpmPackageInfo
+	var info PackageJSON
 	err := json.Unmarshal([]byte(`{
 		"name": "foo",
 		"version": "1.0.0",
@@ -35,25 +35,34 @@ func TestPackageJsonParse(t *testing.T) {
 	if info.SideEffectsFalse != true {
 		t.Fatal("invalid sideEffects")
 	}
-	if info.ESMConfig["bundle"] != false {
+	if info.Esmsh["bundle"] != false {
 		t.Fatal("invalid esm.sh config")
 	}
 }
 
 func TestPkgPath(t *testing.T) {
-	pkgName, pkgVersion, subPath := splitPkgPath("react")
+	pkgName, pkgVersion, subPath, _ := splitPkgPath("react")
 	if pkgName != "react" || pkgVersion != "" || subPath != "" {
-		t.Fatal("invalid splitPkgPath('react')")
+		t.Fatal("split pkg path: 'react'")
 	}
-	pkgName, pkgVersion, subPath = splitPkgPath("react@18.2.0")
+	pkgName, pkgVersion, subPath, _ = splitPkgPath("react@18.2.0")
 	if pkgName != "react" || pkgVersion != "18.2.0" || subPath != "" {
-		t.Fatal("invalid splitPkgPath('react@18.2.0')")
+		t.Fatal("split pkg path: 'react@18.2.0'")
 	}
-	pkgName, pkgVersion, subPath = splitPkgPath("react-dom@18.2.0/server")
+	pkgName, pkgVersion, subPath, _ = splitPkgPath("react-dom@18.2.0/server")
 	if pkgName != "react-dom" || pkgVersion != "18.2.0" || subPath != "server" {
-		t.Fatal("invalid splitPkgPath('react@18.2.0/server')")
+		t.Fatal("split pkg path: 'react@18.2.0/server'")
 	}
-	pkg, q, err := validatePkgPath("react@18.2.0")
+	pkgName, pkgVersion, subPath, hasTarget := splitPkgPath("react-dom@18.2.0/es2022/server.js")
+	if pkgName != "react-dom" || pkgVersion != "18.2.0" || subPath != "es2022/server.js" || !hasTarget {
+		t.Fatal("split pkg path: 'react-dom@18.2.0/es2022/server.js'")
+	}
+	pkgName, pkgVersion, subPath, hasTarget = splitPkgPath("react-dom@18.2.0/X-Args64/es2022/server.js")
+	if pkgName != "react-dom" || pkgVersion != "18.2.0" || subPath != "X-Args64/es2022/server.js" || !hasTarget {
+		t.Fatal("split pkg path: 'react-dom@18.2.0/es2022/server.js'")
+	}
+
+	pkg, q, _, _, err := validateESMPath(nil, "react@18.2.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +73,7 @@ func TestPkgPath(t *testing.T) {
 		t.Fatalf("invalid pkg('%v'), should be 'react@18.2.0'", pkg)
 	}
 
-	pkg, q, err = validatePkgPath("react-dom@18.2.0/client")
+	pkg, q, _, _, err = validateESMPath(nil, "react-dom@18.2.0/client")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +84,7 @@ func TestPkgPath(t *testing.T) {
 		t.Fatalf("invalid pkg('%v'), should be 'react-dom@18.2.0/client'", pkg)
 	}
 
-	pkg, q, err = validatePkgPath("react-dom@18.2.0&dev/client.js")
+	pkg, q, _, _, err = validateESMPath(nil, "react-dom@18.2.0&dev/client.js")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,16 +93,5 @@ func TestPkgPath(t *testing.T) {
 	}
 	if pkg.String() != "react-dom@18.2.0/client" {
 		t.Fatalf("invalid pkg('%v'), should be 'react-dom@18.2.0/client'", pkg)
-	}
-
-	pkg, q, err = validatePkgPath("@types/react@18.2.0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if q != "" {
-		t.Fatalf("invalid unquery('%s'), should be empty", q)
-	}
-	if pkg.String() != "@types/react@"+fixedPkgVersions["@types/react@18"] {
-		t.Fatalf("invalid pkg('%v'), should be '@types/react@%s'", pkg, fixedPkgVersions["@types/react@18"])
 	}
 }

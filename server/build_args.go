@@ -10,28 +10,27 @@ import (
 
 type BuildArgs struct {
 	alias             map[string]string
-	deps              PkgSlice
-	conditions        *stringSet
-	external          *stringSet
-	exports           *stringSet
-	denoStdVersion    string
-	ignoreAnnotations bool
-	ignoreRequire     bool
+	deps              map[string]string
+	external          *StringSet
+	exports           *StringSet
+	conditions        []string
+	jsxRuntime        *Pkg
 	keepNames         bool
+	ignoreAnnotations bool
+	externalRequire   bool
 }
 
-func decodeBuildArgsPrefix(raw string) (args BuildArgs, err error) {
-	s, err := atobUrl(strings.TrimPrefix(strings.TrimSuffix(raw, "/"), "X-"))
+func decodeBuildArgs(npmrc *NpmRC, argsString string) (args BuildArgs, err error) {
+	s, err := atobUrl(argsString)
 	if err == nil {
 		args = BuildArgs{
-			external:   newStringSet(),
-			exports:    newStringSet(),
-			conditions: newStringSet(),
+			external: NewStringSet(),
+			exports:  NewStringSet(),
 		}
 		for _, p := range strings.Split(s, "\n") {
-			if strings.HasPrefix(p, "a/") {
+			if strings.HasPrefix(p, "a") {
 				args.alias = map[string]string{}
-				for _, p := range strings.Split(strings.TrimPrefix(strings.TrimPrefix(p, "a/"), "alias:"), ",") {
+				for _, p := range strings.Split(p[1:], ",") {
 					name, to := utils.SplitByFirstByte(p, ':')
 					name = strings.TrimSpace(name)
 					to = strings.TrimSpace(to)
@@ -39,40 +38,35 @@ func decodeBuildArgsPrefix(raw string) (args BuildArgs, err error) {
 						args.alias[name] = to
 					}
 				}
-			} else if strings.HasPrefix(p, "d/") {
-				for _, p := range strings.Split(strings.TrimPrefix(strings.TrimPrefix(p, "d/"), "deps:"), ",") {
-					m, _, err := validatePkgPath(p)
-					if err != nil {
-						if strings.HasSuffix(err.Error(), "not found") {
-							continue
-						}
-						return args, err
-					}
-					if !args.deps.Has(m.Name) {
-						args.deps = append(args.deps, m)
-					}
+			} else if strings.HasPrefix(p, "d") {
+				deps := map[string]string{}
+				for _, p := range strings.Split(p[1:], ",") {
+					pkgName, pkgVersion, _, _ := splitPkgPath(p)
+					deps[pkgName] = pkgVersion
 				}
-			} else if strings.HasPrefix(p, "e/") {
-				for _, name := range strings.Split(strings.TrimPrefix(p, "e/"), ",") {
+				args.deps = deps
+			} else if strings.HasPrefix(p, "e") {
+				for _, name := range strings.Split(p[1:], ",") {
 					args.external.Add(name)
 				}
-			} else if strings.HasPrefix(p, "ts/") {
-				for _, name := range strings.Split(strings.TrimPrefix(p, "ts/"), ",") {
+			} else if strings.HasPrefix(p, "s") {
+				for _, name := range strings.Split(p[1:], ",") {
 					args.exports.Add(name)
 				}
-			} else if strings.HasPrefix(p, "c/") {
-				for _, name := range strings.Split(strings.TrimPrefix(p, "c/"), ",") {
-					args.conditions.Add(name)
+			} else if strings.HasPrefix(p, "c") {
+				args.conditions = append(args.conditions, strings.Split(p[1:], ",")...)
+			} else if strings.HasPrefix(p, "x") {
+				p, _, _, _, e := validateESMPath(npmrc, p[1:])
+				if e == nil {
+					args.jsxRuntime = &p
 				}
-			} else if strings.HasPrefix(p, "dsv/") {
-				args.denoStdVersion = strings.TrimPrefix(p, "dsv/")
 			} else {
 				switch p {
-				case "ir":
-					args.ignoreRequire = true
-				case "kn":
+				case "r":
+					args.externalRequire = true
+				case "k":
 					args.keepNames = true
-				case "ia":
+				case "i":
 					args.ignoreAnnotations = true
 				}
 			}
@@ -81,88 +75,148 @@ func decodeBuildArgsPrefix(raw string) (args BuildArgs, err error) {
 	return
 }
 
-func encodeBuildArgsPrefix(args BuildArgs, pkg Pkg, forTypes bool) string {
+func encodeBuildArgs(args BuildArgs, pkg Pkg, isDts bool) string {
 	lines := []string{}
-	if !(stableBuild[pkg.Name] && pkg.SubModule == "") {
-		if len(args.alias) > 0 {
+	if len(args.alias) > 0 {
+		var ss sort.StringSlice
+		for from, to := range args.alias {
+			if from != pkg.Name {
+				ss = append(ss, fmt.Sprintf("%s:%s", from, to))
+			}
+		}
+		if len(ss) > 0 {
+			ss.Sort()
+			lines = append(lines, fmt.Sprintf("a%s", strings.Join(ss, ",")))
+		}
+	}
+	if len(args.deps) > 0 {
+		var ss sort.StringSlice
+		for name, version := range args.deps {
+			if name != pkg.Name {
+				ss = append(ss, fmt.Sprintf("%s@%s", name, version))
+			}
+		}
+		if len(ss) > 0 {
+			ss.Sort()
+			lines = append(lines, fmt.Sprintf("d%s", strings.Join(ss, ",")))
+		}
+	}
+	if args.external.Len() > 0 {
+		var ss sort.StringSlice
+		for _, name := range args.external.Values() {
+			if name != pkg.Name {
+				ss = append(ss, name)
+			}
+		}
+		if len(ss) > 0 {
+			ss.Sort()
+			lines = append(lines, fmt.Sprintf("e%s", strings.Join(ss, ",")))
+		}
+	}
+	if !isDts {
+		if args.exports.Len() > 0 {
 			var ss sort.StringSlice
-			for name, to := range args.alias {
-				if name != pkg.Name {
-					ss = append(ss, fmt.Sprintf("%s:%s", name, to))
-				}
+			for _, name := range args.exports.Values() {
+				ss = append(ss, name)
 			}
 			if len(ss) > 0 {
 				ss.Sort()
-				lines = append(lines, fmt.Sprintf("a/%s", strings.Join(ss, ",")))
-			}
-		}
-		if len(args.deps) > 0 {
-			var ss sort.StringSlice
-			for _, p := range args.deps {
-				// react-dom always depends the same version of react
-				if pkg.Name == "react-dom" && p.Name == "react" {
-					continue
-				}
-				if p.Name != pkg.Name {
-					ss = append(ss, fmt.Sprintf("%s@%s", p.Name, p.Version))
-				}
-			}
-			if len(ss) > 0 {
-				ss.Sort()
-				lines = append(lines, fmt.Sprintf("d/%s", strings.Join(ss, ",")))
-			}
-		}
-		if args.external.Len() > 0 {
-			var ss sort.StringSlice
-			for _, name := range args.external.Values() {
-				if name != pkg.Name {
-					ss = append(ss, name)
-				}
-			}
-			if len(ss) > 0 {
-				ss.Sort()
-				lines = append(lines, fmt.Sprintf("e/%s", strings.Join(ss, ",")))
-			}
-		}
-		if !forTypes {
-			if args.exports.Len() > 0 {
-				var ss sort.StringSlice
-				for _, name := range args.exports.Values() {
-					ss = append(ss, name)
-				}
-				if len(ss) > 0 {
-					ss.Sort()
-					lines = append(lines, fmt.Sprintf("ts/%s", strings.Join(ss, ",")))
-				}
+				lines = append(lines, fmt.Sprintf("s%s", strings.Join(ss, ",")))
 			}
 		}
 	}
-	if args.conditions.Len() > 0 {
+	if len(args.conditions) > 0 {
 		var ss sort.StringSlice
-		for _, name := range args.conditions.Values() {
+		for _, name := range args.conditions {
 			ss = append(ss, name)
 		}
 		if len(ss) > 0 {
 			ss.Sort()
-			lines = append(lines, fmt.Sprintf("c/%s", strings.Join(ss, ",")))
+			lines = append(lines, fmt.Sprintf("c%s", strings.Join(ss, ",")))
 		}
 	}
-	if !forTypes {
-		if args.denoStdVersion != "" && args.denoStdVersion != denoStdVersion {
-			lines = append(lines, fmt.Sprintf("dsv/%s", args.denoStdVersion))
-		}
-		if args.ignoreRequire {
-			lines = append(lines, "ir")
+	if !isDts {
+		if args.externalRequire {
+			lines = append(lines, "r")
 		}
 		if args.keepNames {
-			lines = append(lines, "kn")
+			lines = append(lines, "k")
 		}
 		if args.ignoreAnnotations {
-			lines = append(lines, "ia")
+			lines = append(lines, "i")
 		}
 	}
+	if args.jsxRuntime != nil {
+		lines = append(lines, fmt.Sprintf("x%s", args.jsxRuntime.String()))
+	}
 	if len(lines) > 0 {
-		return fmt.Sprintf("X-%s/", btoaUrl(strings.Join(lines, "\n")))
+		return btoaUrl(strings.Join(lines, "\n"))
 	}
 	return ""
+}
+
+func fixBuildArgs(npmrc *NpmRC, args *BuildArgs, pkg Pkg) {
+	if len(args.alias) > 0 || len(args.deps) > 0 || args.external.Len() > 0 {
+		depTree := NewStringSet(walkDeps(npmrc, NewStringSet(), pkg)...)
+		if len(args.alias) > 0 {
+			alias := map[string]string{}
+			for from, to := range args.alias {
+				if depTree.Has(from) {
+					alias[from] = to
+				}
+			}
+			for _, to := range alias {
+				pkgName, _, _, _ := splitPkgPath(to)
+				depTree.Add(pkgName)
+			}
+			args.alias = alias
+		}
+		if len(args.deps) > 0 {
+			newDeps := map[string]string{}
+			for name, version := range args.deps {
+				if depTree.Has(name) {
+					newDeps[name] = version
+				}
+			}
+			args.deps = newDeps
+		}
+		if args.external.Len() > 0 {
+			external := NewStringSet()
+			for _, name := range args.external.Values() {
+				if depTree.Has(name) {
+					external.Add(name)
+				}
+			}
+			args.external = external
+		}
+	}
+}
+
+func walkDeps(npmrc *NpmRC, marker *StringSet, pkg Pkg) (deps []string) {
+	if marker.Has(pkg.Name) {
+		return nil
+	}
+	marker.Add(pkg.Name)
+	p, err := npmrc.getPackageInfo(pkg.Name, pkg.Version)
+	if err != nil {
+		return nil
+	}
+	pkgDeps := map[string]string{}
+	for name, version := range p.Dependencies {
+		pkgDeps[name] = version
+	}
+	for name, version := range p.PeerDependencies {
+		pkgDeps[name] = version
+	}
+	ch := make(chan []string, len(pkgDeps))
+	for name, version := range pkgDeps {
+		deps = append(deps, name)
+		go func(c chan []string, marker *StringSet, name, version string) {
+			c <- walkDeps(npmrc, marker, Pkg{Name: name, Version: version})
+		}(ch, marker, name, version)
+	}
+	for range pkgDeps {
+		deps = append(deps, <-ch...)
+	}
+	return
 }

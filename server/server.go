@@ -1,135 +1,132 @@
 package server
 
 import (
-	"embed"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path"
-	"strings"
-	"sync"
 	"syscall"
 
-	"github.com/esm-dev/esm.sh/server/config"
 	"github.com/esm-dev/esm.sh/server/storage"
 
-	logx "github.com/ije/gox/log"
+	logger "github.com/ije/gox/log"
 	"github.com/ije/rex"
 )
 
 var (
-	cfg          *config.Config
-	cache        storage.Cache
-	db           storage.DataBase
-	fs           storage.FileSystem
-	buildQueue   *BuildQueue
-	log          *logx.Logger
-	embedFS      EmbedFS
-	fetchLocks   sync.Map
-	installLocks sync.Map
+	buildQueue *BuildQueue
+	config     *Config
+	cache      storage.Cache
+	db         storage.DataBase
+	fs         storage.FileSystem
+	log        *logger.Logger
 )
 
-type EmbedFS interface {
-	ReadFile(name string) ([]byte, error)
-}
-
-// Serve serves ESM server
+// Serve serves the esm.sh server
 func Serve(efs EmbedFS) {
 	var (
 		cfile string
-		isDev bool
+		debug bool
 		err   error
 	)
 
 	flag.StringVar(&cfile, "config", "config.json", "the config file path")
-	flag.BoolVar(&isDev, "dev", false, "to run server in development mode")
+	flag.BoolVar(&debug, "debug", false, "to run server in DEUBG mode")
 	flag.Parse()
 
-	if !fileExists(cfile) {
-		cfg = config.Default()
-		fmt.Println("Config file not found, use default config")
+	if !existsFile(cfile) {
+		config = DefaultConfig()
+		if cfile != "config.json" {
+			fmt.Println("Config file not found, use default config")
+		}
 	} else {
-		cfg, err = config.Load(cfile)
+		config, err = LoadConfig(cfile)
 		if err != nil {
 			fmt.Println(err.Error())
 			os.Exit(1)
 		}
-		fmt.Println("Config loaded from", cfile)
+		if debug {
+			fmt.Println("Config loaded from", cfile)
+		}
 	}
+	buildQueue = NewBuildQueue(int(config.BuildConcurrency))
 
-	if isDev {
-		cfg.LogLevel = "debug"
+	if debug {
+		config.LogLevel = "debug"
 		cwd, err := os.Getwd()
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(1)
 		}
-		embedFS = &devFS{cwd}
+		embedFS = &MockEmbedFS{cwd}
 	} else {
 		os.Setenv("NO_COLOR", "1") // disable log color in production
 		embedFS = efs
 	}
 
-	log, err = logx.New(fmt.Sprintf("file:%s?buffer=32k", path.Join(cfg.LogDir, fmt.Sprintf("main-v%d.log", VERSION))))
+	log, err = logger.New(fmt.Sprintf("file:%s?buffer=32k", path.Join(config.LogDir, fmt.Sprintf("main-v%d.log", VERSION))))
 	if err != nil {
 		fmt.Printf("initiate logger: %v\n", err)
 		os.Exit(1)
 	}
-	log.SetLevelByName(cfg.LogLevel)
+	log.SetLevelByName(config.LogLevel)
 
-	nodeInstallDir := os.Getenv("NODE_INSTALL_DIR")
-	if nodeInstallDir == "" {
-		nodeInstallDir = path.Join(cfg.WorkDir, "nodejs")
-	}
-	nodeVer, pnpmVer, err := checkNodejs(nodeInstallDir)
+	cache, err = storage.OpenCache(config.Cache)
 	if err != nil {
-		log.Fatalf("check nodejs: %v", err)
+		log.Fatalf("init cache(%s): %v", config.Cache, err)
 	}
-	if cfg.NpmRegistry == "" {
-		output, err := exec.Command("npm", "config", "get", "registry").CombinedOutput()
-		if err == nil {
-			cfg.NpmRegistry = strings.TrimRight(strings.TrimSpace(string(output)), "/") + "/"
-		}
-	}
-	log.Infof("nodejs v%s installed, registry: %s, pnpm: %s", nodeVer, cfg.NpmRegistry, pnpmVer)
 
-	err = initCJSLexerWorkDirectory()
+	fs, err = storage.OpenFS(config.Storage)
 	if err != nil {
-		log.Fatalf("init cjs-lexer: %v", err)
+		log.Fatalf("init fs(%s): %v", config.Storage, err)
 	}
 
-	cache, err = storage.OpenCache(cfg.Cache)
+	db, err = storage.OpenDB(config.Database)
 	if err != nil {
-		log.Fatalf("init storage(cache,%s): %v", cfg.Cache, err)
+		log.Fatalf("init db(%s): %v", config.Database, err)
 	}
 
-	fs, err = storage.OpenFS(cfg.Storage)
+	err = loadNodeLibs(efs)
 	if err != nil {
-		log.Fatalf("init storage(fs,%s): %v", cfg.Storage, err)
+		log.Fatalf("load node libs: %v", err)
 	}
+	log.Debugf("%d node libs loaded", len(nodeLibs))
 
-	db, err = storage.OpenDB(cfg.Database)
+	err = loadNpmPolyfills(efs)
 	if err != nil {
-		log.Fatalf("init storage(db,%s): %v", cfg.Database, err)
+		log.Fatalf("load npm polyfills: %v", err)
 	}
+	log.Debugf("%d npm polyfills loaded", len(npmPolyfills))
 
-	buildQueue = newBuildQueue(int(cfg.BuildConcurrency))
-
-	var accessLogger *logx.Logger
-	if cfg.LogDir == "" {
-		accessLogger = &logx.Logger{}
+	var accessLogger *logger.Logger
+	if config.LogDir == "" {
+		accessLogger = &logger.Logger{}
 	} else {
-		accessLogger, err = logx.New(fmt.Sprintf("file:%s?buffer=32k&fileDateFormat=20060102", path.Join(cfg.LogDir, "access.log")))
+		accessLogger, err = logger.New(fmt.Sprintf("file:%s?buffer=32k&fileDateFormat=20060102", path.Join(config.LogDir, "access.log")))
 		if err != nil {
-			log.Fatalf("initiate access logger: %v", err)
+			log.Fatalf("failed to initialize access logger: %v", err)
 		}
 	}
 	accessLogger.SetQuite(true) // quite in terminal
 
-	if !cfg.NoCompress {
+	nodejsInstallDir := os.Getenv("NODE_INSTALL_DIR")
+	if nodejsInstallDir == "" {
+		nodejsInstallDir = path.Join(config.WorkDir, "nodejs")
+	}
+	nodeVer, pnpmVer, err := checkNodejs(nodejsInstallDir)
+	if err != nil {
+		log.Fatalf("nodejs: %v", err)
+	}
+	log.Debugf("nodejs: v%s, pnpm: %s, registry: %s", nodeVer, pnpmVer, config.NpmRegistry)
+
+	err = initCJSLexerNodeApp()
+	if err != nil {
+		log.Fatalf("failed to initialize the cjs_lexer node app: %v", err)
+	}
+	log.Debugf("%s initialized", cjsLexerPkg)
+
+	if !config.DisableCompression {
 		rex.Use(rex.Compression())
 	}
 	rex.Use(
@@ -137,36 +134,28 @@ func Serve(efs EmbedFS) {
 		rex.AccessLogger(accessLogger),
 		rex.Header("Server", "esm.sh"),
 		rex.Cors(rex.CORS{
-			AllowedOrigins: []string{"*"},
-			AllowedMethods: []string{
-				http.MethodGet,
-				http.MethodPost,
-			},
-			ExposedHeaders:   []string{"X-TypeScript-Types"},
+			AllowedOrigins:   []string{"*"},
+			AllowedMethods:   []string{"HEAD", "GET", "POST"},
+			ExposedHeaders:   []string{"ETag", "X-ESM-Path", "X-TypeScript-Types"},
+			MaxAge:           86400, // 24 hours
 			AllowCredentials: false,
 		}),
-		auth(cfg.AuthSecret),
-		apiHandler(),
-		esmHandler(),
+		auth(config.AuthSecret),
+		router(),
 	)
 
 	C := rex.Serve(rex.ServerConfig{
-		Port: uint16(cfg.Port),
+		Port: uint16(config.Port),
 		TLS: rex.TLSConfig{
-			Port: uint16(cfg.TlsPort),
+			Port: uint16(config.TlsPort),
 			AutoTLS: rex.AutoTLSConfig{
-				AcceptTOS: cfg.TlsPort > 0 && !isDev,
-				CacheDir:  path.Join(cfg.WorkDir, "autotls"),
+				AcceptTOS: config.TlsPort > 0 && !debug,
+				CacheDir:  path.Join(config.WorkDir, "autotls"),
 			},
 		},
 	})
 
-	if isDev {
-		log.Debugf("Server is ready on http://localhost:%d", cfg.Port)
-		log.Debugf("Testing page at http://localhost:%d?test", cfg.Port)
-	} else {
-		log.Info("Server is ready")
-	}
+	log.Infof("Server is ready on http://localhost:%d", config.Port)
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGHUP, syscall.SIGABRT)
@@ -180,9 +169,4 @@ func Serve(efs EmbedFS) {
 	db.Close()
 	log.FlushBuffer()
 	accessLogger.FlushBuffer()
-}
-
-func init() {
-	embedFS = &embed.FS{}
-	log = &logx.Logger{}
 }

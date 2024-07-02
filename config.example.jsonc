@@ -4,28 +4,32 @@
 
   // The port to listen server on for HTTPs, default is 0 (disabled). Change to 443 if you want to enable it.
   // You don't need to provide a certificate, it will generate automatically by autocert.
+  // Note: Docker users needs to provide tls certificate.
   "tlsPort": 0,
 
-  // The port to listen server on for node service, default is 8088 (do not change if you don't know what you are doing).
-  "nsPort": 8088,
+  // The secret token to validate the `Authorization: Bearer <secret>` header of requests, default is disabled.
+  "authSecret": "",
 
   // The build max concurrency, default is `runtime.NumCPU()`
   "buildConcurrency": 0,
 
+  // The max waiting time for the build to complete, default is 30 seconds.
+  "buildTimeout": 30,
+
   // The work directory for the server app, default is "~/.esmd".
   "workDir": "~/.esmd",
 
-  // The cache url, default is "memory:default".
+  // The cache source, default is "memory:default".
   // You can also implement your own cache by implementing the `Cache` interface
   // in https://github.com/esm-dev/esm.sh/blob/main/server/storage/cache.go
   "cache": "memory:default",
 
-  // The database url, default is "bolt:~/.esmd/esm.db".
+  // The database source, default is "bolt:~/.esmd/esm.db".
   // You can also implement your own database by implementing the `DataBase` interface
   // in https://github.com/esm-dev/esm.sh/blob/main/server/storage/db.go
   "database": "bolt:~/.esmd/esm.db",
 
-  // The file storage url, default is "local:~/.esmd/storage".
+  // The file storage source, default is "local:~/.esmd/storage".
   // You can also implement your own file storage by implementing the `FileSystem` interface
   // in https://github.com/esm-dev/esm.sh/blob/main/server/storage/fs.go
   "storage": "local:~/.esmd/storage",
@@ -33,54 +37,54 @@
   // The log directory, default is "~/.esmd/log".
   "logDir": "~/.esmd/log",
 
-  // The log level, default is "info", you can also set it to "debug" to enable debug logs.
+  // The log level, available values are ["debug", "info", "warn", "error"], default is "info".
   "logLevel": "info",
 
-  // The origin of CDN, default is using the origin of the request.
-  // Use to fix origin with reverse proxy, for examle "https://esm.sh"
-  "cdnOrigin": "",
-
-  // The base path of CDN, default is "/".
-  "cdnBasePath": "/",
-
-  // The npm registry, default is "https://registry.npmjs.org/".
+  // The global npm registry, default is "https://registry.npmjs.org/".
   "npmRegistry": "https://registry.npmjs.org/",
 
-  // The scope applied to the npm registry. This will ensure only packages
-  // with this scope get downloaded from the registry, default is empty.
-  // Default behavior is to fetch all packages from the npm registry.
-  "npmRegistryScope": "@my-scope",
+  // The npm access token for the global npm registry, default is empty.
+  "npmToken": "",
 
-  // These two fields are used for basic authentication towards a private
-  // package registry, default for both is empty.
+  // These two fields are used for basic authentication towards the global npm registry,
+  // default for both is empty.
   "npmUser": "",
   "npmPassword": "",
 
-  // The npm token for private packages, default is empty.
-  "npmToken": "",
+  // Registries for scoped packages. This will ensure packages with these scopes get downloaded
+  // from specific registry, default is empty.
+  "npmRegistries": {
+    "@scope_name": {
+      "registry": "https://your-registry.com/",
+      "token": "xxx",
+      "user": "username",
+      "password": "xxx"
+    }
+  },
 
-  // Disable compressing the response, default is false.
-  "noCompress": false,
+  // Whether to minify the build JS/CSS files, default is true.
+  "minify": true,
 
-  // The auth secret to validate the `Authorization` header of requests, default is no auth.
-  "authSecret": "",
+  // Disable http compression, default is false.
+  "disableCompression": false,
+
+  // Disable generating source map for build js files, default is false.
+  "disableSourceMap": false,
 
   // The list to ban some packages or scopes.
   "banList": {
-    "packages": ["@some_scope/package_name"],
+    "packages": ["@scope_name/package_name"],
     "scopes": [{
-      "name": "@your_scope",
-      "excludes": [
-        "package_name"
-      ]
+      "name": "@scope_name",
+      "excludes": ["package_name"]
     }]
   },
 
   // The list to only allow some packages or scopes.
   "allowList": {
-    "packages": ["@some_scope/package_name"],
+    "packages": ["@scope_name/package_name"],
     "scopes": [{
-      "name": "@your_scope"
+      "name": "@scope_name"
     }]
   }
 }

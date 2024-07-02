@@ -8,7 +8,7 @@ import (
 	"github.com/Masterminds/semver/v3"
 	"github.com/evanw/esbuild/pkg/api"
 	"github.com/ije/esbuild-internal/compat"
-	"github.com/mssola/useragent"
+	"github.com/mileusna/useragent"
 )
 
 var regexpBrowserVersion = regexp.MustCompile(`^(\d+)(?:\.(\d+))?(?:\.(\d+))?$`)
@@ -174,12 +174,13 @@ func countFeatures(feature compat.JSFeature) int {
 }
 
 func getBrowserInfo(ua string) (name string, version string) {
-	name, version = useragent.New(ua).Browser()
-	if name == "HeadlessChrome" {
-		return "Chrome", version
-	}
-	if name == "Safari" && strings.Contains(ua, "iPhone;") {
-		return "iOS", version
+	browser := useragent.Parse(ua)
+	name = browser.Name
+	version = browser.Version
+	if name == "Headless Chrome" {
+		name = "Chrome"
+	} else if browser.IsIOS() {
+		name = "iOS"
 	}
 	return
 }
@@ -188,14 +189,21 @@ func getBuildTargetByUA(ua string) string {
 	if ua == "" || strings.HasPrefix(ua, "curl/") {
 		return "esnext"
 	}
+	if strings.HasPrefix(ua, "ES/") {
+		t := "es" + ua[3:]
+		if _, ok := targets[t]; ok {
+			return t
+		}
+		return "esnext"
+	}
 	if strings.HasPrefix(ua, "Deno/") {
-		uaVersion, err := semver.NewVersion(strings.TrimPrefix(ua, "Deno/"))
+		uaVersion, err := semver.NewVersion(ua[5:])
 		if err == nil && uaVersion.LessThan(v1_33_2) {
 			return "deno"
 		}
 		return "denonext"
 	}
-	if ua == "undici" || strings.HasPrefix(ua, "Node/") || strings.HasPrefix(ua, "Bun/") {
+	if ua == "undici" || strings.HasPrefix(ua, "Node.js/") || strings.HasPrefix(ua, "Node/") || strings.HasPrefix(ua, "Bun/") {
 		return "node"
 	}
 	name, version := getBrowserInfo(ua)
@@ -223,5 +231,5 @@ func getBuildTargetByUA(ua string) string {
 			}
 		}
 	}
-	return "esnext"
+	return "es2015"
 }

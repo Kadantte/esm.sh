@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -11,7 +12,6 @@ import (
 	"path"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/esm-dev/esm.sh/server/storage"
@@ -21,17 +21,20 @@ import (
 	"github.com/ije/gox/valid"
 )
 
-// ref https://github.com/npm/validate-npm-package-name
+const npmRegistry = "https://registry.npmjs.org/"
+const jsrRegistry = "https://npm.jsr.io/"
+
+// base https://github.com/npm/validate-npm-package-name
 var npmNaming = valid.Validator{valid.FromTo{'a', 'z'}, valid.FromTo{'A', 'Z'}, valid.FromTo{'0', '9'}, valid.Eq('.'), valid.Eq('-'), valid.Eq('_')}
 
 // NpmPackageVerions defines versions of a NPM package
 type NpmPackageVerions struct {
 	DistTags map[string]string         `json:"dist-tags"`
-	Versions map[string]NpmPackageInfo `json:"versions"`
+	Versions map[string]PackageJSONRaw `json:"versions"`
 }
 
-// NpmPackageJSON defines the package.json of NPM
-type NpmPackageJSON struct {
+// PackageJSONRaw defines the package.json of a NPM package
+type PackageJSONRaw struct {
 	Name             string                 `json:"name"`
 	Version          string                 `json:"version"`
 	Type             string                 `json:"type,omitempty"`
@@ -47,12 +50,14 @@ type NpmPackageJSON struct {
 	PeerDependencies map[string]string      `json:"peerDependencies,omitempty"`
 	Imports          map[string]interface{} `json:"imports,omitempty"`
 	TypesVersions    map[string]interface{} `json:"typesVersions,omitempty"`
-	PkgExports       json.RawMessage        `json:"exports,omitempty"`
+	Exports          json.RawMessage        `json:"exports,omitempty"`
+	Files            []string               `json:"files,omitempty"`
 	Deprecated       interface{}            `json:"deprecated,omitempty"`
-	ESMConfig        interface{}            `json:"esm.sh,omitempty"`
+	Esmsh            interface{}            `json:"esm.sh,omitempty"`
 }
 
-func (a *NpmPackageJSON) ToNpmPackage() *NpmPackageInfo {
+// ToNpmPackage converts PackageJSONRaw to PackageJSON
+func (a *PackageJSONRaw) ToNpmPackage() *PackageJSON {
 	browser := map[string]string{}
 	if a.Browser.Str != "" {
 		browser["."] = a.Browser.Str
@@ -76,47 +81,50 @@ func (a *NpmPackageJSON) ToNpmPackage() *NpmPackageInfo {
 			deprecated = s
 		}
 	}
-	esmConfig := map[string]interface{}{}
-	if a.ESMConfig != nil {
-		if v, ok := a.ESMConfig.(map[string]interface{}); ok {
-			esmConfig = v
+	esmsh := map[string]interface{}{}
+	if a.Esmsh != nil {
+		if v, ok := a.Esmsh.(map[string]interface{}); ok {
+			esmsh = v
 		}
 	}
-	var sideEffects *stringSet = nil
+	var sideEffects *StringSet = nil
 	sideEffectsFalse := false
 	if a.SideEffects != nil {
 		if s, ok := a.SideEffects.(string); ok {
-			sideEffectsFalse = s == "false"
+			if s == "false" {
+				sideEffectsFalse = true
+			} else if endsWith(s, jsExts...) {
+				sideEffects = NewStringSet()
+				sideEffects.Add(s)
+			}
 		} else if b, ok := a.SideEffects.(bool); ok {
 			sideEffectsFalse = !b
 		} else if m, ok := a.SideEffects.([]interface{}); ok && len(m) > 0 {
-			sideEffects = newStringSet()
+			sideEffects = NewStringSet()
 			for _, v := range m {
-				if name, ok := v.(string); ok {
+				if name, ok := v.(string); ok && endsWith(name, jsExts...) {
 					sideEffects.Add(name)
 				}
 			}
 		}
 	}
-	var pkgExports interface{} = nil
-	if rawExports := a.PkgExports; rawExports != nil {
+	var exports interface{} = nil
+	if rawExports := a.Exports; rawExports != nil {
 		var v interface{}
 		if json.Unmarshal(rawExports, &v) == nil {
 			if s, ok := v.(string); ok {
 				if len(s) > 0 {
-					pkgExports = s
+					exports = s
 				}
 			} else if _, ok := v.(map[string]interface{}); ok {
 				om := newOrderedMap()
 				if om.UnmarshalJSON(rawExports) == nil {
-					pkgExports = om
-				} else {
-					pkgExports = v
+					exports = om
 				}
 			}
 		}
 	}
-	return &NpmPackageInfo{
+	return &PackageJSON{
 		Name:             a.Name,
 		Version:          a.Version,
 		Type:             a.Type,
@@ -133,15 +141,17 @@ func (a *NpmPackageJSON) ToNpmPackage() *NpmPackageInfo {
 		PeerDependencies: a.PeerDependencies,
 		Imports:          a.Imports,
 		TypesVersions:    a.TypesVersions,
-		PkgExports:       pkgExports,
+		Exports:          exports,
+		Files:            a.Files,
 		Deprecated:       deprecated,
-		ESMConfig:        esmConfig,
+		Esmsh:            esmsh,
 	}
 }
 
-// NpmPackage defines the package.json
-type NpmPackageInfo struct {
+// PackageJSON defines defines the package.json of a NPM package
+type PackageJSON struct {
 	Name             string
+	PkgName          string
 	Version          string
 	Type             string
 	Main             string
@@ -151,19 +161,21 @@ type NpmPackageInfo struct {
 	Types            string
 	Typings          string
 	SideEffectsFalse bool
-	SideEffects      *stringSet
+	SideEffects      *StringSet
 	Browser          map[string]string
 	Dependencies     map[string]string
 	PeerDependencies map[string]string
 	Imports          map[string]interface{}
 	TypesVersions    map[string]interface{}
-	PkgExports       interface{}
+	Exports          interface{}
+	Files            []string
 	Deprecated       string
-	ESMConfig        map[string]interface{}
+	Esmsh            map[string]interface{}
 }
 
-func (a *NpmPackageInfo) UnmarshalJSON(b []byte) error {
-	var n NpmPackageJSON
+// UnmarshalJSON implements the json.Unmarshaler interface
+func (a *PackageJSON) UnmarshalJSON(b []byte) error {
+	var n PackageJSONRaw
 	if err := json.Unmarshal(b, &n); err != nil {
 		return err
 	}
@@ -171,9 +183,83 @@ func (a *NpmPackageInfo) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func getPackageInfo(wd string, name string, version string) (info NpmPackageInfo, fromPackageJSON bool, err error) {
+type NpmRegistry struct {
+	Registry string `json:"registry"`
+	Token    string `json:"token"`
+	User     string `json:"user"`
+	Password string `json:"password"`
+}
+
+type NpmRC struct {
+	NpmRegistry
+	Registries map[string]NpmRegistry `json:"registries"`
+	zoneId     string
+}
+
+func NewNpmRcFromConfig() *NpmRC {
+	rc := &NpmRC{
+		NpmRegistry: NpmRegistry{
+			Registry: config.NpmRegistry,
+			Token:    config.NpmToken,
+			User:     config.NpmUser,
+			Password: config.NpmPassword,
+		},
+		Registries: map[string]NpmRegistry{
+			"@jsr": {
+				Registry: jsrRegistry,
+			},
+		},
+	}
+	if len(config.NpmRegistries) > 0 {
+		for scope, reg := range config.NpmRegistries {
+			rc.Registries[scope] = NpmRegistry{
+				Registry: reg.Registry,
+				Token:    reg.Token,
+				User:     reg.User,
+				Password: reg.Password,
+			}
+		}
+	}
+	return rc
+}
+
+func NewNpmRcFromJSON(jsonData []byte) (npmrc *NpmRC, err error) {
+	var rc NpmRC
+	err = json.Unmarshal(jsonData, &rc)
+	if err != nil {
+		return nil, err
+	}
+	if rc.Registry == "" {
+		rc.Registry = config.NpmRegistry
+	} else if !strings.HasSuffix(rc.Registry, "/") {
+		rc.Registry += "/"
+	}
+	if rc.Registries == nil {
+		rc.Registries = map[string]NpmRegistry{}
+	}
+	if _, ok := rc.Registries["@jsr"]; !ok {
+		rc.Registries["@jsr"] = NpmRegistry{
+			Registry: jsrRegistry,
+		}
+	}
+	for _, reg := range rc.Registries {
+		if reg.Registry != "" && !strings.HasSuffix(reg.Registry, "/") {
+			reg.Registry += "/"
+		}
+	}
+	return &rc, nil
+}
+
+func (rc *NpmRC) Dir() string {
+	if rc.zoneId != "" {
+		return path.Join(config.WorkDir, "npm-"+rc.zoneId)
+	}
+	return path.Join(config.WorkDir, "npm")
+}
+
+func (rc *NpmRC) getPackageInfo(name string, version string) (info PackageJSON, err error) {
 	if name == "@types/node" {
-		info = NpmPackageInfo{
+		info = PackageJSON{
 			Name:    "@types/node",
 			Version: nodeTypesVersion,
 			Types:   "index.d.ts",
@@ -181,23 +267,18 @@ func getPackageInfo(wd string, name string, version string) (info NpmPackageInfo
 		return
 	}
 
-	if wd != "" {
-		pkgJsonPath := path.Join(wd, "node_modules", name, "package.json")
-		if fileExists(pkgJsonPath) && utils.ParseJSONFile(pkgJsonPath, &info) == nil {
-			info, err = fixPkgVersion(info)
-			fromPackageJSON = true
+	if regexpFullVersion.MatchString(version) {
+		pkgJsonPath := path.Join(rc.Dir(), name+"@"+version, "node_modules", name, "package.json")
+		if existsFile(pkgJsonPath) && parseJSONFile(pkgJsonPath, &info) == nil {
 			return
 		}
 	}
 
-	info, err = fetchPackageInfo(name, version)
-	if err == nil {
-		info, err = fixPkgVersion(info)
-	}
+	info, err = rc.fetchPackageInfo(name, version)
 	return
 }
 
-func fetchPackageInfo(name string, version string) (info NpmPackageInfo, err error) {
+func (rc *NpmRC) fetchPackageInfo(name string, version string) (info PackageJSON, err error) {
 	a := strings.Split(strings.Trim(name, "/"), "/")
 	name = a[0]
 	if strings.HasPrefix(name, "@") && len(a) > 1 {
@@ -210,9 +291,8 @@ func fetchPackageInfo(name string, version string) (info NpmPackageInfo, err err
 	if version == "" {
 		version = "latest"
 	}
-	isFullVersion := regexpFullVersion.MatchString(version)
 
-	cacheKey := fmt.Sprintf("npm:%s@%s", name, version)
+	cacheKey := fmt.Sprintf("npm:%s/%s@%s", rc.zoneId, name, version)
 	lock := getFetchLock(cacheKey)
 	lock.Lock()
 	defer lock.Unlock()
@@ -236,56 +316,78 @@ func fetchPackageInfo(name string, version string) (info NpmPackageInfo, err err
 		}
 	}()
 
-	url := cfg.NpmRegistry + name
-	if cfg.NpmRegistryScope != "" {
-		isInScope := strings.HasPrefix(name, cfg.NpmRegistryScope)
-		if !isInScope {
-			url = "https://registry.npmjs.org/" + name
+	url := rc.Registry + name
+	token := rc.Token
+	user := rc.User
+	password := rc.Password
+
+	if strings.HasPrefix(name, "@") {
+		scope, _ := utils.SplitByFirstByte(name, '/')
+		reg, ok := rc.Registries[scope]
+		if ok {
+			url = reg.Registry + name
+			token = reg.Token
+			user = reg.User
+			password = reg.Password
 		}
 	}
 
-	if isFullVersion {
+	isFullVersion := regexpFullVersion.MatchString(version)
+	isFullVersionFromNpmjsOrg := isFullVersion && strings.HasPrefix(url, npmRegistry)
+	if isFullVersionFromNpmjsOrg {
+		// npm registry supports url like `https://registry.npmjs.org/<name>/<version>`
 		url += "/" + version
 	}
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return
 	}
-	if cfg.NpmToken != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.NpmToken)
-	}
-	if cfg.NpmUser != "" && cfg.NpmPassword != "" {
-		req.SetBasicAuth(cfg.NpmUser, cfg.NpmPassword)
+
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	} else if user != "" && password != "" {
+		req.SetBasicAuth(user, password)
 	}
 
-	resp, err := httpClient.Do(req)
+	c := &http.Client{
+		Timeout: 15 * time.Second,
+	}
+	retryTimes := 0
+do:
+	resp, err := c.Do(req)
 	if err != nil {
+		if retryTimes < 3 {
+			retryTimes++
+			time.Sleep(time.Duration(retryTimes) * 100 * time.Millisecond)
+			goto do
+		}
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 404 || resp.StatusCode == 401 {
-		if isFullVersion {
-			err = fmt.Errorf("npm: version %s of '%s' not found", version, name)
+		if isFullVersionFromNpmjsOrg {
+			err = fmt.Errorf("version %s of '%s' not found", version, name)
 		} else {
-			err = fmt.Errorf("npm: package '%s' not found", name)
+			err = fmt.Errorf("package '%s' not found", name)
 		}
 		return
 	}
 
 	if resp.StatusCode != 200 {
 		ret, _ := io.ReadAll(resp.Body)
-		err = fmt.Errorf("npm: could not get metadata of package '%s' (%s: %s)", name, resp.Status, string(ret))
+		err = fmt.Errorf("could not get metadata of package '%s' (%s: %s)", name, resp.Status, string(ret))
 		return
 	}
 
-	if isFullVersion {
+	if isFullVersionFromNpmjsOrg {
 		err = json.NewDecoder(resp.Body).Decode(&info)
 		if err != nil {
 			return
 		}
 		if cache != nil {
-			cache.Set(cacheKey, utils.MustEncodeJSON(info), 24*time.Hour)
+			cache.Set(cacheKey, mustEncodeJSON(info), 7*24*time.Hour)
 		}
 		return
 	}
@@ -297,18 +399,22 @@ func fetchPackageInfo(name string, version string) (info NpmPackageInfo, err err
 	}
 
 	if len(h.Versions) == 0 {
-		err = fmt.Errorf("npm: missing `versions` field")
+		err = fmt.Errorf("missing `versions` field")
 		return
 	}
 
+	var jsonBytes []byte
+
 	distVersion, ok := h.DistTags[version]
 	if ok {
-		info = h.Versions[distVersion]
+		d := h.Versions[distVersion]
+		info = *d.ToNpmPackage()
+		jsonBytes = mustEncodeJSON(d)
 	} else {
 		var c *semver.Constraints
 		c, err = semver.NewConstraint(version)
 		if err != nil && version != "latest" {
-			return fetchPackageInfo(name, "latest")
+			return rc.fetchPackageInfo(name, "latest")
 		}
 		vs := make([]*semver.Version, len(h.Versions))
 		i := 0
@@ -332,123 +438,156 @@ func fetchPackageInfo(name string, version string) (info NpmPackageInfo, err err
 			if i > 1 {
 				sort.Sort(semver.Collection(vs))
 			}
-			info = h.Versions[vs[i-1].String()]
+			d := h.Versions[vs[i-1].String()]
+			info = *d.ToNpmPackage()
+			jsonBytes = mustEncodeJSON(d)
 		}
 	}
 
 	if info.Version == "" {
-		err = fmt.Errorf("npm: version %s of '%s' not found", version, name)
+		err = fmt.Errorf("version %s of '%s' not found", version, name)
 		return
 	}
 
 	// cache package info for 10 minutes
 	if cache != nil {
-		cache.Set(cacheKey, utils.MustEncodeJSON(info), 10*time.Minute)
+		cache.Set(cacheKey, jsonBytes, 10*time.Minute)
 	}
 	return
 }
 
-func installPackage(wd string, pkg Pkg) (err error) {
-	pkgVersionName := pkg.VersionName()
+func (rc *NpmRC) installPackage(pkg Pkg) (err error) {
+	installDir := path.Join(rc.Dir(), pkg.Fullname())
 
-	// only one install process allowed at the same time
-	lock := getInstallLock(pkgVersionName)
+	// only one installation process allowed at the same time for the same package
+	lock := getInstallLock(installDir)
 	lock.Lock()
 	defer lock.Unlock()
 
-	// ensure package.json file to prevent read up-levels
-	packageFilePath := path.Join(wd, "package.json")
-	if pkg.FromEsmsh {
-		err = copyRawBuildFile(pkg.Name, "package.json", wd)
-	} else if pkg.FromGithub || !fileExists(packageFilePath) {
-		fileContent := []byte("{}")
-		if pkg.FromGithub {
-			fileContent = []byte(fmt.Sprintf(
-				`{"dependencies": {"%s": "%s"}}`,
-				pkg.Name,
-				fmt.Sprintf("git+https://github.com/%s.git#%s", pkg.Name, pkg.Version),
-			))
-		}
-		ensureDir(wd)
-		err = os.WriteFile(packageFilePath, fileContent, 0644)
-	}
-	if err != nil {
-		return fmt.Errorf("ensure package.json failed: %s", pkgVersionName)
+	// skip installation if the pnpm-lock file exists
+	if existsFile(path.Join(installDir, "pnpm-lock.yaml")) && existsFile(path.Join(installDir, "node_modules", pkg.Name, "package.json")) {
+		return nil
 	}
 
-	for i := 0; i < 3; i++ {
-		if pkg.FromEsmsh {
-			err = pnpmInstall(wd)
+	// create '.npmrc' file
+	err = rc.createDotNpmRcFile(installDir)
+	if err != nil {
+		err = fmt.Errorf("failed to create .npmrc file: %v", err)
+		return
+	}
+
+	// ensure 'package.json' file to prevent read up-levels
+	packageJsonFp := path.Join(installDir, "package.json")
+	if !existsFile(packageJsonFp) {
+		ensureDir(installDir)
+		err = os.WriteFile(packageJsonFp, []byte("{}"), 0644)
+	}
+	if err != nil {
+		return fmt.Errorf("ensure package.json failed: %s", pkg.Fullname())
+	}
+
+	attemptMaxTimes := 3
+	for i := 1; i <= attemptMaxTimes; i++ {
+		if pkg.FromGithub {
+			err = os.WriteFile(packageJsonFp, []byte(fmt.Sprintf(`{"dependencies":{"%s":"github:%s#%s"}}`, pkg.Name, pkg.Name, pkg.Version)), 0644)
 			if err == nil {
-				installDir := path.Join(wd, "node_modules", pkg.Name)
-				for _, name := range []string{"package.json", "index.mjs", "index.d.ts"} {
-					err = copyRawBuildFile(pkg.Name, name, installDir)
-					if err != nil {
-						break
+				err = rc.pnpm(installDir)
+			}
+			// pnpm will ignore github package which has been installed without `package.json` file
+			// so we install it manually
+			if err == nil {
+				packageJsonFp := path.Join(installDir, "node_modules", pkg.Name, "package.json")
+				if !existsFile(packageJsonFp) {
+					ensureDir(path.Dir(packageJsonFp))
+					err = os.WriteFile(packageJsonFp, mustEncodeJSON(pkg), 0644)
+				} else {
+					var p PackageJSON
+					err = parseJSONFile(packageJsonFp, &p)
+					if err == nil && len(p.Files) > 0 {
+						// install github package with ignoring `files` field
+						err = ghInstall(installDir, pkg.Name, pkg.Version)
 					}
 				}
 			}
-		} else if pkg.FromGithub {
-			err = pnpmInstall(wd)
-			// pnpm will ignore github package which has been installed without `package.json` file
-			if err == nil && !dirExists(path.Join(wd, "node_modules", pkg.Name)) {
-				err = ghInstall(wd, pkg.Name, pkg.Version)
-			}
 		} else if regexpFullVersion.MatchString(pkg.Version) {
-			err = pnpmInstall(wd, pkgVersionName, "--prefer-offline")
+			err = rc.pnpm(installDir, pkg.Fullname(), "--prefer-offline")
 		} else {
-			err = pnpmInstall(wd, pkgVersionName)
+			err = rc.pnpm(installDir, pkg.Fullname())
 		}
-		packageFilePath := path.Join(wd, "node_modules", pkg.Name, "package.json")
-		if err == nil && !fileExists(packageFilePath) {
-			if pkg.FromGithub {
-				ensureDir(path.Dir(packageFilePath))
-				err = os.WriteFile(packageFilePath, utils.MustEncodeJSON(pkg), 0644)
-			} else {
-				err = fmt.Errorf("pnpm install %s: package.json not found", pkg)
-			}
+		packageJsonFp := path.Join(installDir, "node_modules", pkg.Name, "package.json")
+		if err == nil && !existsFile(packageJsonFp) {
+			err = fmt.Errorf("pnpm install %s: package.json not found", pkg)
 		}
-		if err == nil {
+		if err == nil || i == attemptMaxTimes {
 			break
 		}
-		if i < 2 {
-			time.Sleep(100 * time.Millisecond)
-		}
+		time.Sleep(time.Duration(i) * time.Second)
 	}
 	return
 }
 
-func pnpmInstall(wd string, packages ...string) (err error) {
+func (rc *NpmRC) pnpm(dir string, packages ...string) (err error) {
 	var args []string
 	if len(packages) > 0 {
 		args = append([]string{"add"}, packages...)
 	} else {
-		args = []string{"install"}
+		args = []string{
+			"install",
+			"--no-optional",
+			"--ignore-pnpmfile",
+			"--ignore-workspace",
+		}
 	}
 	args = append(
 		args,
+		"--no-color",
 		"--ignore-scripts",
-		"--loglevel", "error",
+		"--loglevel=error",
 	)
 	start := time.Now()
+	out := &bytes.Buffer{}
+	errout := &bytes.Buffer{}
 	cmd := exec.Command("pnpm", args...)
-	cmd.Dir = wd
-	if cfg.NpmToken != "" {
-		cmd.Env = append(os.Environ(), "ESM_NPM_TOKEN="+cfg.NpmToken)
-	}
-	if cfg.NpmUser != "" && cfg.NpmPassword != "" {
-		data := []byte(cfg.NpmPassword)
+	cmd.Env = os.Environ()
+	cmd.Dir = dir
+	cmd.Stdout = out
+	cmd.Stderr = errout
+	cmd.WaitDelay = 10 * time.Minute
+
+	// for security, we don't put token and password in the `.npmrc` file
+	// instead, we pass them as environment variables to the `pnpm` subprocess
+	if rc.Token != "" {
+		cmd.Env = append(cmd.Environ(), "ESM_NPM_TOKEN="+rc.Token)
+	} else if rc.User != "" && rc.Password != "" {
+		data := []byte(rc.Password)
 		password := make([]byte, base64.StdEncoding.EncodedLen(len(data)))
 		base64.StdEncoding.Encode(password, data)
 		cmd.Env = append(
-			os.Environ(),
-			"ESM_NPM_USER="+cfg.NpmUser,
+			cmd.Environ(),
+			"ESM_NPM_USER="+rc.User,
 			"ESM_NPM_PASSWORD="+string(password),
 		)
 	}
-	output, err := cmd.CombinedOutput()
+	for scope, reg := range rc.Registries {
+		if reg.Token != "" {
+			cmd.Env = append(cmd.Environ(), fmt.Sprintf("ESM_NPM_TOKEN_%s=%s", toEnvName(scope[1:]), reg.Token))
+		} else if reg.User != "" && reg.Password != "" {
+			data := []byte(reg.Password)
+			password := make([]byte, base64.StdEncoding.EncodedLen(len(data)))
+			base64.StdEncoding.Encode(password, data)
+			cmd.Env = append(
+				cmd.Env,
+				fmt.Sprintf("ESM_NPM_USER_%s=%s", toEnvName(scope[1:]), reg.User),
+				fmt.Sprintf("ESM_NPM_PASSWORD_%s=%s", toEnvName(scope[1:]), string(password)),
+			)
+		}
+	}
+	err = cmd.Run()
+	if err == nil && errout.Len() > 0 {
+		return fmt.Errorf("%s", errout.String())
+	}
 	if err != nil {
-		return fmt.Errorf("pnpm add %s: %s", strings.Join(packages, ","), string(output))
+		return fmt.Errorf("pnpm %s: %s", strings.Join(args, " "), out.String())
 	}
 	if len(packages) > 0 {
 		log.Debug("pnpm add", strings.Join(packages, ","), "in", time.Since(start))
@@ -456,6 +595,41 @@ func pnpmInstall(wd string, packages ...string) (err error) {
 		log.Debug("pnpm install in", time.Since(start))
 	}
 	return
+}
+
+func (rc *NpmRC) createDotNpmRcFile(dir string) error {
+	buf := bytes.NewBuffer(nil)
+	if rc.Registry != "" {
+		buf.WriteString(fmt.Sprintf("registry=%s\n", rc.Registry))
+		if rc.Token != "" {
+			authPerfix := removeHttpUrlProtocol(rc.Registry)
+			buf.WriteString(fmt.Sprintf("%s:_authToken=${ESM_NPM_TOKEN}\n", authPerfix))
+		}
+		if rc.User != "" && rc.Password != "" {
+			authPerfix := removeHttpUrlProtocol(rc.Registry)
+			buf.WriteString(fmt.Sprintf("%s:username=${ESM_NPM_USER}\n", authPerfix))
+			buf.WriteString(fmt.Sprintf("%s:_password=${ESM_NPM_PASSWORD}\n", authPerfix))
+		}
+	}
+	for scope, reg := range rc.Registries {
+		if reg.Registry != "" {
+			buf.WriteString(fmt.Sprintf("%s:registry=%s\n", scope, reg.Registry))
+			if reg.Token != "" {
+				authPerfix := removeHttpUrlProtocol(reg.Registry)
+				buf.WriteString(fmt.Sprintf("%s:_authToken=${ESM_NPM_TOKEN_%s}\n", authPerfix, toEnvName(scope[1:])))
+			}
+			if reg.User != "" && reg.Password != "" {
+				authPerfix := removeHttpUrlProtocol(reg.Registry)
+				buf.WriteString(fmt.Sprintf("%s:username=${ESM_NPM_USER_%s}\n", authPerfix, toEnvName(scope[1:])))
+				buf.WriteString(fmt.Sprintf("%s:_password=${ESM_NPM_PASSWORD_%s}\n", authPerfix, toEnvName(scope[1:])))
+			}
+		}
+	}
+	err := ensureDir(dir)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path.Join(dir, ".npmrc"), buf.Bytes(), 0644)
 }
 
 // ref https://github.com/npm/validate-npm-package-name
@@ -473,32 +647,9 @@ func validatePackageName(name string) bool {
 }
 
 // added by @jimisaacs
-func toTypesPackageName(pkgName string) string {
+func toTypesPkgName(pkgName string) string {
 	if strings.HasPrefix(pkgName, "@") {
 		pkgName = strings.Replace(pkgName[1:], "/", "__", 1)
 	}
 	return "@types/" + pkgName
-}
-
-func fixPkgVersion(info NpmPackageInfo) (NpmPackageInfo, error) {
-	for prefix, ver := range fixedPkgVersions {
-		if strings.HasPrefix(info.Name+"@"+info.Version, prefix) {
-			return fetchPackageInfo(info.Name, ver)
-		}
-	}
-	return info, nil
-}
-
-func isTypesOnlyPackage(p NpmPackageInfo) bool {
-	return p.Main == "" && p.Module == "" && p.Types != ""
-}
-
-func getInstallLock(key string) *sync.Mutex {
-	v, _ := installLocks.LoadOrStore(key, &sync.Mutex{})
-	return v.(*sync.Mutex)
-}
-
-func getFetchLock(key string) *sync.Mutex {
-	v, _ := fetchLocks.LoadOrStore(key, &sync.Mutex{})
-	return v.(*sync.Mutex)
 }

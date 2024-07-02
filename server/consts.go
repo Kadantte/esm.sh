@@ -1,50 +1,9 @@
 package server
 
-const (
-	// esm.sh build version
-	VERSION = 135
-	// esm.sh stable build version, used for UI libraries like react, to make sure the runtime is single copy
-	// change this carefully!
-	STABLE_VERSION = 128
-)
+// esm.sh version
+const VERSION = 136
 
-const (
-	nodejsMinVersion = 16
-	nodejsLatestLTS  = "18.16.0"
-	nodeTypesVersion = "18.16.19"
-	denoStdVersion   = "0.177.1"
-)
-
-// fix some npm package versions
-var fixedPkgVersions = map[string]string{
-	"@types/react@17": "17.0.71",
-	"@types/react@18": "18.2.38",
-	"isomorphic-ws@4": "5.0.0",
-	"resolve@1.22":    "1.22.2", // 1.22.3+ will read package.json from disk
-}
-
-// css packages
-var cssPackages = map[string]string{
-	"@unocss/reset":    "tailwind.css",
-	"inter-ui":         "inter.css",
-	"normalize.css":    "normalize.css",
-	"modern-normalize": "modern-normalize.css",
-	"reset-css":        "reset.css",
-}
-
-// stable build for UI libraries like react, to make sure the runtime is single copy
-var stableBuild = map[string]bool{
-	"preact":            true,
-	"react":             true,
-	"solid-js":          true,
-	"svelte":            true,
-	"vue":               true,
-	"@vue/reactivity":   true,
-	"@vue/runtime-core": true,
-	"@vue/runtime-dom":  true,
-	"@vue/shared":       true,
-}
-
+// asset extensions
 var assetExts = map[string]bool{
 	"wasm":       true,
 	"css":        true,
@@ -103,15 +62,11 @@ var assetExts = map[string]bool{
 	"tgz":        true,
 }
 
-// native node packages, for `deno` target use `npm:package` to import (skip build)
-var nativeNodePackages = []string{
-	"@achingbrain/ssdp",
-	"default-gateway",
-	"fsevent",
-	"re2",
-	"zlib-sync",
-}
-
-var denoNextUnspportedNodeModules = map[string]bool{
-	"inspector": true,
+// css packages
+var cssPackages = map[string]string{
+	"@unocss/reset":    "tailwind.css",
+	"inter-ui":         "inter.css",
+	"normalize.css":    "normalize.css",
+	"modern-normalize": "modern-normalize.css",
+	"reset-css":        "reset.css",
 }

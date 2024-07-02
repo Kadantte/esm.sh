@@ -2,50 +2,34 @@ package server
 
 import (
 	"bytes"
-	"container/list"
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
-	"path"
-	"sort"
 	"strings"
 	"sync"
 )
 
-type devFS struct {
-	cwd string
-}
-
-func (fs devFS) ReadFile(name string) ([]byte, error) {
-	return os.ReadFile(path.Join(fs.cwd, name))
-}
-
-func (fs devFS) Lstat(name string) (os.FileInfo, error) {
-	return os.Lstat(path.Join(fs.cwd, name))
-}
-
-type stringSet struct {
+type StringSet struct {
 	lock sync.RWMutex
 	set  map[string]struct{}
 }
 
-func newStringSet(keys ...string) *stringSet {
+func NewStringSet(keys ...string) *StringSet {
 	set := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
 		set[key] = struct{}{}
 	}
-	return &stringSet{set: set}
+	return &StringSet{set: set}
 }
 
-func (s *stringSet) Len() int {
+func (s *StringSet) Len() int {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 
 	return len(s.set)
 }
 
-func (s *stringSet) Has(key string) bool {
+func (s *StringSet) Has(key string) bool {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 
@@ -53,28 +37,28 @@ func (s *stringSet) Has(key string) bool {
 	return ok
 }
 
-func (s *stringSet) Add(key string) {
+func (s *StringSet) Add(key string) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
 	s.set[key] = struct{}{}
 }
 
-func (s *stringSet) Remove(key string) {
+func (s *StringSet) Remove(key string) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
 	delete(s.set, key)
 }
 
-func (s *stringSet) Reset() {
+func (s *StringSet) Reset() {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
 	s.set = map[string]struct{}{}
 }
 
-func (s *stringSet) Values() []string {
+func (s *StringSet) Values() []string {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 
@@ -85,12 +69,6 @@ func (s *stringSet) Values() []string {
 		i++
 	}
 	return a
-}
-
-func (s *stringSet) SortedValues() []string {
-	values := sort.StringSlice(s.Values())
-	sort.Sort(values)
-	return values
 }
 
 type StringOrMap struct {
@@ -142,43 +120,39 @@ func (a SortedPaths) Swap(i, j int) {
 	a[i], a[j] = a[j], a[i]
 }
 
-// The orderedMap type, has similar operations as the default map type
 // copied from https://gitlab.com/c0b/go-ordered-json
-type orderedMap struct {
+type OrderedMap struct {
 	lock sync.RWMutex
+	keys []string
 	m    map[string]interface{}
-	l    *list.List
-	keys map[string]*list.Element // the double linked list for delete and lookup to be O(1)
 }
 
 // Create a new orderedMap
-func newOrderedMap() *orderedMap {
-	return &orderedMap{
-		m:    make(map[string]interface{}),
-		l:    list.New(),
-		keys: make(map[string]*list.Element),
+func newOrderedMap() *OrderedMap {
+	return &OrderedMap{
+		m: make(map[string]interface{}),
 	}
 }
 
 // Set sets value for particular key, this will remember the order of keys inserted
 // but if the key already exists, the order is not updated.
-func (om *orderedMap) Set(key string, value interface{}) {
+func (om *OrderedMap) Set(key string, value interface{}) {
 	om.lock.Lock()
 	defer om.lock.Unlock()
 	if _, ok := om.m[key]; !ok {
-		om.keys[key] = om.l.PushBack(key)
+		om.keys = append(om.keys, key)
 	}
 	om.m[key] = value
 }
 
-// Entry returns the key and value by the given list element
-func (om *orderedMap) Entry(e *list.Element) (string, interface{}) {
-	key := e.Value.(string)
-	return key, om.m[key]
+func (om *OrderedMap) Get(key string) interface{} {
+	om.lock.RLock()
+	defer om.lock.RUnlock()
+	return om.m[key]
 }
 
 // UnmarshalJSON implements type json.Unmarshaler interface, so can be called in json.Unmarshal(data, om)
-func (om *orderedMap) UnmarshalJSON(data []byte) error {
+func (om *OrderedMap) UnmarshalJSON(data []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 
@@ -191,7 +165,7 @@ func (om *orderedMap) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("expect JSON object open with '{'")
 	}
 
-	err = om.parseobject(dec)
+	err = om.parseObject(dec)
 	if err != nil {
 		return err
 	}
@@ -204,7 +178,7 @@ func (om *orderedMap) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (om *orderedMap) parseobject(dec *json.Decoder) (err error) {
+func (om *OrderedMap) parseObject(dec *json.Decoder) (err error) {
 	var t json.Token
 	for dec.More() {
 		t, err = dec.Token()
@@ -225,13 +199,12 @@ func (om *orderedMap) parseobject(dec *json.Decoder) (err error) {
 		}
 
 		var value interface{}
-		value, err = handledelim(t, dec)
+		value, err = handleDelim(t, dec)
 		if err != nil {
 			return err
 		}
 
-		// om.keys = append(om.keys, key)
-		om.keys[key] = om.l.PushBack(key)
+		om.keys = append(om.keys, key)
 		om.m[key] = value
 	}
 
@@ -246,7 +219,7 @@ func (om *orderedMap) parseobject(dec *json.Decoder) (err error) {
 	return nil
 }
 
-func parsearray(dec *json.Decoder) (arr []interface{}, err error) {
+func parseArray(dec *json.Decoder) (arr []interface{}, err error) {
 	var t json.Token
 	arr = make([]interface{}, 0)
 	for dec.More() {
@@ -256,7 +229,7 @@ func parsearray(dec *json.Decoder) (arr []interface{}, err error) {
 		}
 
 		var value interface{}
-		value, err = handledelim(t, dec)
+		value, err = handleDelim(t, dec)
 		if err != nil {
 			return
 		}
@@ -274,19 +247,19 @@ func parsearray(dec *json.Decoder) (arr []interface{}, err error) {
 	return
 }
 
-func handledelim(t json.Token, dec *json.Decoder) (res interface{}, err error) {
+func handleDelim(t json.Token, dec *json.Decoder) (res interface{}, err error) {
 	if delim, ok := t.(json.Delim); ok {
 		switch delim {
 		case '{':
 			om2 := newOrderedMap()
-			err = om2.parseobject(dec)
+			err = om2.parseObject(dec)
 			if err != nil {
 				return
 			}
 			return om2, nil
 		case '[':
 			var value []interface{}
-			value, err = parsearray(dec)
+			value, err = parseArray(dec)
 			if err != nil {
 				return
 			}

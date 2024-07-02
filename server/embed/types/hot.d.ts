@@ -1,61 +1,33 @@
+export interface ArchiveEntry {
+  name: string;
+  type: string;
+  lastModified: number;
+  offset: number;
+  size: number;
+}
+
 export interface Plugin {
-  name: string;
-  setup: (hot: HotCore) => void;
+  (hot: Omit<Hot, "fire" | "listen">): void;
+  displayName?: string;
 }
 
-export interface ImportMap {
-  $support?: boolean;
-  imports?: Record<string, string>;
-  scopes?: Record<string, Record<string, string>>;
+export interface FireOptions {
+  main?: string;
+  buildTarget?: `es20${15 | 16 | 17 | 18 | 19 | 20 | 21 | 22}`;
+  swModule?: string;
+  swScope?: string;
+  swUpdateViaCache?: ServiceWorkerUpdateViaCache;
 }
 
-export interface FetchHandler {
-  (req: Request): Response | Promise<Response>;
+export interface Hot {
+  use(...plugins: readonly Plugin[]): this;
+  onFetch(handler: (event: FetchEvent) => void): this;
+  onFire(handler: (sw: ServiceWorker) => void): this;
+  onUpdateFound: () => void;
+  waitUntil(...promises: readonly Promise<any>[]): this;
+  fire(options?: FireOptions): Promise<ServiceWorker>;
+  listen(): void;
 }
 
-export interface IncomingTest {
-  (url: URL, req: Request): boolean;
-}
-
-export interface VFile {
-  name: string;
-  data: string | Uint8Array;
-  meta?: VFileMeta;
-}
-
-export interface VFileMeta {
-  [key: string]: any;
-  checksum?: string;
-  contentType?: string;
-}
-
-export interface VFS {
-  get(name: string): Promise<VFile | undefined>;
-  put(
-    name: string,
-    data: string | Uint8Array,
-    meta?: VFile["meta"],
-  ): Promise<string>;
-  delete(name: string): Promise<void>;
-}
-
-export interface HotCore {
-  readonly cache: Cache;
-  readonly importMap: Required<ImportMap>;
-  readonly isDev: boolean;
-  readonly vfs: VFS;
-  fire(): Promise<void>;
-  listen(swScript?: string): void;
-  onFetch(test: IncomingTest, handler: FetchHandler): this;
-  onFire(handler: (reg: ServiceWorker) => void): this;
-  waitUntil(promise: Promise<any>): void;
-  use(...plugins: Plugin[]): this;
-}
-
-declare global {
-  interface HotAPI {}
-}
-
-export interface Hot extends HotCore, HotAPI {}
-
-export default Hot;
+export const hot: Hot;
+export default hot;

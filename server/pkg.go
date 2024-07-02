@@ -3,8 +3,10 @@ package server
 import (
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 
+	"github.com/Masterminds/semver/v3"
 	"github.com/ije/gox/utils"
 	"github.com/ije/gox/valid"
 )
@@ -12,22 +14,27 @@ import (
 type Pkg struct {
 	Name       string `json:"name"`
 	Version    string `json:"version"`
-	SubPath    string `json:"fullsubModule"`
+	SubPath    string `json:"subPath"`
 	SubModule  string `json:"subModule"`
 	FromGithub bool   `json:"fromGithub"`
-	FromEsmsh  bool   `json:"fromEsmsh"`
 }
 
-func validatePkgPath(pathname string) (pkg Pkg, extraQuery string, err error) {
+func validateESMPath(rc *NpmRC, pathname string) (pkg Pkg, extraQuery string, isCaretVersion bool, hasTarget bool, err error) {
 	fromGithub := strings.HasPrefix(pathname, "/gh/") && strings.Count(pathname, "/") >= 3
 	if fromGithub {
 		pathname = "/@" + pathname[4:]
+	} else if strings.HasPrefix(pathname, "/jsr/@") && strings.Count(pathname, "/") >= 3 {
+		segs := strings.Split(pathname, "/")
+		pathname = "/@jsr/" + segs[2][1:] + "__" + segs[3]
+		if len(segs) > 4 {
+			pathname += "/" + strings.Join(segs[4:], "/")
+		}
 	}
 
-	pkgName, maybeVersion, subPath := splitPkgPath(pathname)
-	fromEsmsh := strings.HasPrefix(pkgName, "~") && valid.IsHexString(pkgName[1:])
-	if !fromEsmsh && !validatePackageName(pkgName) {
-		return Pkg{}, "", fmt.Errorf("invalid package name '%s'", pkgName)
+	pkgName, maybeVersion, subPath, hasTarget := splitPkgPath(pathname)
+	if !validatePackageName(pkgName) {
+		err = fmt.Errorf("invalid package name '%s'", pkgName)
+		return
 	}
 
 	version, extraQuery := utils.SplitByFirstByte(maybeVersion, '&')
@@ -41,18 +48,17 @@ func validatePkgPath(pathname string) (pkg Pkg, extraQuery string, err error) {
 		SubPath:    subPath,
 		SubModule:  toModuleBareName(subPath, true),
 		FromGithub: fromGithub,
-		FromEsmsh:  fromEsmsh,
 	}
 
-	if fromEsmsh {
-		pkg.Version = "0.0.0"
-		return
+	// workaround for es5-ext weird "/#/" path
+	if pkg.SubModule != "" && pkg.Name == "es5-ext" {
+		pkg.SubModule = strings.ReplaceAll(pkg.SubModule, "/%23/", "/#/")
 	}
 
 	if fromGithub {
 		// strip the leading `@`
 		pkg.Name = pkg.Name[1:]
-		if (valid.IsHexString(pkg.Version) && len(pkg.Version) >= 10) || regexpFullVersion.MatchString(strings.TrimPrefix(pkg.Version, "v")) {
+		if (valid.IsHexString(pkg.Version) && len(pkg.Version) >= 7) || regexpFullVersion.MatchString(strings.TrimPrefix(pkg.Version, "v")) {
 			return
 		}
 		var refs []GitRef
@@ -63,16 +69,39 @@ func validatePkgPath(pathname string) (pkg Pkg, extraQuery string, err error) {
 		if pkg.Version == "" {
 			for _, ref := range refs {
 				if ref.Ref == "HEAD" {
-					pkg.Version = ref.Sha[:10]
+					pkg.Version = ref.Sha[:16]
 					return
 				}
 			}
-		} else if strings.HasPrefix(pkg.Version, "semver:") {
-			// TODO: support semver
 		} else {
+			// try to find the exact tag or branch
 			for _, ref := range refs {
 				if ref.Ref == "refs/tags/"+pkg.Version || ref.Ref == "refs/heads/"+pkg.Version {
-					pkg.Version = ref.Sha[:10]
+					pkg.Version = ref.Sha[:16]
+					return
+				}
+			}
+			// try to find the semver tag
+			var c *semver.Constraints
+			c, err = semver.NewConstraint(strings.TrimPrefix(pkg.Version, "semver:"))
+			if err == nil {
+				vs := make([]*semver.Version, len(refs))
+				i := 0
+				for _, ref := range refs {
+					if strings.HasPrefix(ref.Ref, "refs/tags/") {
+						v, e := semver.NewVersion(strings.TrimPrefix(ref.Ref, "refs/tags/"))
+						if e == nil && c.Check(v) {
+							vs[i] = v
+							i++
+						}
+					}
+				}
+				if i > 0 {
+					vs = vs[:i]
+					if i > 1 {
+						sort.Sort(semver.Collection(vs))
+					}
+					pkg.Version = vs[i-1].String()
 					return
 				}
 			}
@@ -81,46 +110,33 @@ func validatePkgPath(pathname string) (pkg Pkg, extraQuery string, err error) {
 		return
 	}
 
-	// use fixed version
-	for prefix, fixedVersion := range fixedPkgVersions {
-		if strings.HasPrefix(pkgName+"@"+version, prefix) {
-			pkg.Version = fixedVersion
-			return
+	isCaretVersion = strings.HasPrefix(pkg.Version, "^")
+	if isCaretVersion || !regexpFullVersion.MatchString(pkg.Version) {
+		var p PackageJSON
+		p, err = rc.fetchPackageInfo(pkgName, pkg.Version)
+		if err == nil {
+			pkg.Version = p.Version
 		}
-	}
-
-	if regexpFullVersion.MatchString(version) {
-		return
-	}
-
-	p, _, err := getPackageInfo("", pkgName, version)
-	if err == nil {
-		pkg.Version = p.Version
 	}
 	return
 }
 
-func (pkg Pkg) Equels(other Pkg) bool {
-	return pkg.Name == other.Name && pkg.Version == other.Version && pkg.SubModule == other.SubModule
-}
-
-func (pkg Pkg) ImportPath() string {
-	if pkg.SubModule != "" {
-		return pkg.Name + "/" + pkg.SubModule
-	}
-	return pkg.Name
-}
-
-func (pkg Pkg) VersionName() string {
-	s := pkg.Name + "@" + pkg.Version
+func (pkg Pkg) ghPrefix() string {
 	if pkg.FromGithub {
-		s = "gh/" + s
+		return "gh/"
 	}
-	return s
+	return ""
+}
+
+func (pkg Pkg) Fullname() string {
+	if pkg.FromGithub {
+		return "gh/" + pkg.Name + "@" + pkg.Version
+	}
+	return pkg.Name + "@" + pkg.Version
 }
 
 func (pkg Pkg) String() string {
-	s := pkg.VersionName()
+	s := pkg.Fullname()
 	if pkg.SubModule != "" {
 		s += "/" + pkg.SubModule
 	}
@@ -133,39 +149,6 @@ func (a PathSlice) Len() int      { return len(a) }
 func (a PathSlice) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 func (a PathSlice) Less(i, j int) bool {
 	return len(strings.Split(a[i], "/")) < len(strings.Split(a[j], "/"))
-}
-
-// sortable pkg slice
-type PkgSlice []Pkg
-
-func (a PkgSlice) Len() int           { return len(a) }
-func (a PkgSlice) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a PkgSlice) Less(i, j int) bool { return a[i].String() < a[j].String() }
-
-func (a PkgSlice) Has(name string) bool {
-	for _, m := range a {
-		if m.Name == name {
-			return false
-		}
-	}
-	return false
-}
-
-func (a PkgSlice) Get(name string) (Pkg, bool) {
-	for _, m := range a {
-		if m.Name == name {
-			return m, true
-		}
-	}
-	return Pkg{}, false
-}
-
-func (a PkgSlice) String() string {
-	s := make([]string, a.Len())
-	for i, m := range a {
-		s[i] = m.String()
-	}
-	return strings.Join(s, ",")
 }
 
 func toModuleBareName(path string, stripIndexSuffier bool) string {
@@ -186,24 +169,40 @@ func toModuleBareName(path string, stripIndexSuffier bool) string {
 	return ""
 }
 
-func splitPkgPath(specifier string) (pkgName string, version string, subPath string) {
-	a := strings.Split(strings.TrimPrefix(specifier, "/"), "/")
-	pkgNameWithVersion := a[0]
-	subPath = strings.Join(a[1:], "/")
-	if strings.HasPrefix(pkgNameWithVersion, "@") && len(a) > 1 {
-		pkgNameWithVersion = a[0] + "/" + a[1]
+func splitPkgPath(pathname string) (pkgName string, version string, subPath string, hasTarget bool) {
+	a := strings.Split(strings.TrimPrefix(pathname, "/"), "/")
+	nameAndVersion := ""
+	if strings.HasPrefix(a[0], "@") && len(a) > 1 {
+		nameAndVersion = a[0] + "/" + a[1]
 		subPath = strings.Join(a[2:], "/")
+		hasTarget = hasTargetSegment(a[2:])
+	} else {
+		nameAndVersion = a[0]
+		subPath = strings.Join(a[1:], "/")
+		hasTarget = hasTargetSegment(a[1:])
 	}
-	if len(pkgNameWithVersion) > 0 && pkgNameWithVersion[0] == '@' {
-		pkgName, version = utils.SplitByLastByte(pkgNameWithVersion[1:], '@')
+	if len(nameAndVersion) > 0 && nameAndVersion[0] == '@' {
+		pkgName, version = utils.SplitByLastByte(nameAndVersion[1:], '@')
 		pkgName = "@" + pkgName
 	} else {
-		pkgName, version = utils.SplitByLastByte(pkgNameWithVersion, '@')
+		pkgName, version = utils.SplitByLastByte(nameAndVersion, '@')
 	}
 	return
 }
 
+func hasTargetSegment(segments []string) bool {
+	if len(segments) < 2 {
+		return false
+	}
+	if strings.HasPrefix(segments[0], "X-") && len(segments) > 2 {
+		_, ok := targets[segments[1]]
+		return ok
+	}
+	_, ok := targets[segments[0]]
+	return ok
+}
+
 func getPkgName(specifier string) string {
-	name, _, _ := splitPkgPath(specifier)
+	name, _, _, _ := splitPkgPath(specifier)
 	return name
 }

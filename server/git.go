@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -24,7 +25,8 @@ type GitRef struct {
 
 // list repo refs using `git ls-remote repo`
 func listRepoRefs(repo string) (refs []GitRef, err error) {
-	cacheKey := fmt.Sprintf("gh:%s", repo)
+	cacheKey := fmt.Sprintf("git ls-remote %s", repo)
+
 	lock := getFetchLock(cacheKey)
 	lock.Lock()
 	defer lock.Unlock()
@@ -66,14 +68,17 @@ func listRepoRefs(repo string) (refs []GitRef, err error) {
 	}
 
 	if cache != nil {
-		cache.Set(cacheKey, utils.MustEncodeJSON(refs), 10*time.Minute)
+		cache.Set(cacheKey, mustEncodeJSON(refs), 10*time.Minute)
 	}
 	return
 }
 
 func ghInstall(wd, name, hash string) (err error) {
+	c := &http.Client{
+		Timeout: 30 * time.Second,
+	}
 	url := fmt.Sprintf(`https://codeload.github.com/%s/tar.gz/%s`, name, hash)
-	res, err := fetch(url)
+	res, err := c.Get(url)
 	if err != nil {
 		return
 	}

@@ -1,72 +1,41 @@
 package server
 
 import (
-	"context"
+	"bytes"
 	"encoding/base64"
-	"errors"
+	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/Masterminds/semver/v3"
-	"github.com/ije/esbuild-internal/js_ast"
-	"github.com/ije/esbuild-internal/js_parser"
-	"github.com/ije/esbuild-internal/logger"
 )
 
 const EOL = "\n"
 
 var (
-	regexpFullVersion      = regexp.MustCompile(`^\d+\.\d+\.\d+[\w\.\+\-]*$`)
-	regexpFullVersionPath  = regexp.MustCompile(`(\w)@(v?\d+\.\d+\.\d+[\w\.\+\-]*|[0-9a-f]{10})(/|$)`)
-	regexpPathWithVersion  = regexp.MustCompile(`\w@[\*\~\^\w\.\+\-]+(/|$|&)`)
-	regexpBuildVersionPath = regexp.MustCompile(`^/v\d+(/|$)`)
-	regexpCliPath          = regexp.MustCompile(`^/v\d+\/?$`)
-	regexpLocPath          = regexp.MustCompile(`(\.js):\d+:\d+$`)
-	regexpJSIdent          = regexp.MustCompile(`^[a-zA-Z_$][\w$]*$`)
-	regexpGlobalIdent      = regexp.MustCompile(`__[a-zA-Z]+\$`)
-	regexpVarEqual         = regexp.MustCompile(`var ([a-zA-Z]+)\s*=\s*[a-zA-Z]+$`)
+	regexpFullVersion = regexp.MustCompile(`^\d+\.\d+\.\d+[\w\.\+\-]*$`)
+	regexpLocPath     = regexp.MustCompile(`:\d+:\d+$`)
+	regexpJSIdent     = regexp.MustCompile(`^[a-zA-Z_$][\w$]*$`)
+	regexpGlobalIdent = regexp.MustCompile(`__[a-zA-Z]+\$`)
+	regexpVarEqual    = regexp.MustCompile(`var ([\w$]+)\s*=\s*[\w$]+$`)
 )
-
-var httpClient = &http.Client{
-	Transport: &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: transportDialContext(&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}),
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	},
-}
-
-func transportDialContext(dialer *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
-	return dialer.DialContext
-}
-
-func fetch(url string) (res *http.Response, err error) {
-	return httpClient.Get(url)
-}
 
 // isHttpSepcifier returns true if the import path is a remote URL.
 func isHttpSepcifier(importPath string) bool {
 	return strings.HasPrefix(importPath, "https://") || strings.HasPrefix(importPath, "http://")
 }
 
-// isLocalSpecifier returns true if the import path is a local path.
-func isLocalSpecifier(importPath string) bool {
-	return strings.HasPrefix(importPath, "file://") || strings.HasPrefix(importPath, "/") || strings.HasPrefix(importPath, "./") || strings.HasPrefix(importPath, "../") || importPath == "." || importPath == ".."
+// isRelativeSpecifier returns true if the import path is a local path.
+func isRelativeSpecifier(importPath string) bool {
+	return strings.HasPrefix(importPath, "./") || strings.HasPrefix(importPath, "../") || importPath == "." || importPath == ".."
 }
 
+// semverLessThan returns true if the version a is less than the version b.
 func semverLessThan(a string, b string) bool {
 	return semver.MustParse(a).LessThan(semver.MustParse(b))
 }
@@ -84,30 +53,7 @@ func includes(a []string, s string) bool {
 	return false
 }
 
-func filter(a []string, fn func(s string) bool) []string {
-	l := len(a)
-	if l == 0 {
-		return nil
-	}
-	b := make([]string, l)
-	i := 0
-	for _, v := range a {
-		if fn(v) {
-			b[i] = v
-			i++
-		}
-	}
-	return b[:i]
-}
-
-func cloneMap(m map[string]string) map[string]string {
-	n := make(map[string]string, len(m))
-	for k, v := range m {
-		n[k] = v
-	}
-	return n
-}
-
+// endsWith returns true if the given string ends with any of the suffixes.
 func endsWith(s string, suffixs ...string) bool {
 	for _, suffix := range suffixs {
 		if strings.HasSuffix(s, suffix) {
@@ -117,25 +63,19 @@ func endsWith(s string, suffixs ...string) bool {
 	return false
 }
 
-func stripModuleExt(s string) string {
-	for _, ext := range jsExts {
-		if strings.HasSuffix(s, ext) {
-			return s[:len(s)-len(ext)]
-		}
-	}
-	return s
-}
-
-func dirExists(filepath string) bool {
+// existsDir returns true if the given path is a directory.
+func existsDir(filepath string) bool {
 	fi, err := os.Lstat(filepath)
 	return err == nil && fi.IsDir()
 }
 
-func fileExists(filepath string) bool {
+// existsFile returns true if the given path is a file.
+func existsFile(filepath string) bool {
 	fi, err := os.Lstat(filepath)
 	return err == nil && !fi.IsDir()
 }
 
+// ensureDir creates a directory if it does not exist.
 func ensureDir(dir string) (err error) {
 	_, err = os.Lstat(dir)
 	if err != nil && os.IsNotExist(err) {
@@ -144,6 +84,16 @@ func ensureDir(dir string) (err error) {
 	return
 }
 
+// relPath returns a relative path from the base path to the target path.
+func relPath(basePath, targetPath string) (string, error) {
+	rp, err := filepath.Rel(basePath, targetPath)
+	if err == nil && !isRelativeSpecifier(rp) {
+		rp = "./" + rp
+	}
+	return rp, err
+}
+
+// findFiles returns a list of files in the given directory.
 func findFiles(root string, dir string, fn func(p string) bool) ([]string, error) {
 	rootDir, err := filepath.Abs(root)
 	if err != nil {
@@ -183,10 +133,12 @@ func findFiles(root string, dir string, fn func(p string) bool) ([]string, error
 	return files, nil
 }
 
+// btoaUrl converts a string to a base64 string.
 func btoaUrl(s string) string {
 	return strings.TrimRight(base64.URLEncoding.EncodeToString([]byte(s)), "=")
 }
 
+// atobUrl converts a base64 string to a string.
 func atobUrl(s string) (string, error) {
 	if l := len(s) % 4; l > 0 {
 		s += strings.Repeat("=", 4-l)
@@ -198,42 +150,43 @@ func atobUrl(s string) (string, error) {
 	return string(data), nil
 }
 
-func validateJS(filename string) (isESM bool, namedExports []string, err error) {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return
+// removeHttpUrlProtocol removes the `http[s]:` protocol from the given url.
+func removeHttpUrlProtocol(url string) string {
+	if strings.HasPrefix(url, "https://") {
+		return url[6:]
 	}
-	log := logger.NewDeferLog(logger.DeferLogNoVerboseOrDebug, nil)
-	ast, pass := js_parser.Parse(log, logger.Source{
-		Index:          0,
-		KeyPath:        logger.Path{Text: "<stdin>"},
-		PrettyPath:     "<stdin>",
-		Contents:       string(data),
-		IdentifierName: "stdin",
-	}, js_parser.Options{})
-	if !pass {
-		err = errors.New("invalid syntax, require javascript/typescript")
-		return
+	if strings.HasPrefix(url, "http://") {
+		return url[5:]
 	}
-	isESM = ast.ExportsKind == js_ast.ExportsESM
-	namedExports = make([]string, len(ast.NamedExports))
-	i := 0
-	for name := range ast.NamedExports {
-		namedExports[i] = name
-		i++
-	}
-	return
+	return url
 }
 
-func removeHttpPrefix(s string) (string, error) {
-	for i, v := range s {
-		if v == ':' {
-			return s[i+1:], nil
+// appendVaryHeader appends the given key to the `Vary` header.
+func appendVaryHeader(header http.Header, key string) {
+	vary := header.Get("Vary")
+	if vary == "" {
+		header.Set("Vary", key)
+	} else {
+		header.Set("Vary", vary+", "+key)
+	}
+}
+
+// toEnvName converts the given string to an environment variable name.
+func toEnvName(s string) string {
+	runes := []rune(s)
+	for i, r := range runes {
+		if (r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') {
+			runes[i] = r
+		} else if r >= 'a' && r <= 'z' {
+			runes[i] = r - 'a' + 'A'
+		} else {
+			runes[i] = '_'
 		}
 	}
-	return "", fmt.Errorf("colon not found in string: %s", s)
+	return string(runes)
 }
 
+// concatBytes concatenates two byte slices.
 func concatBytes(a, b []byte) []byte {
 	c := make([]byte, len(a)+len(b))
 	copy(c, a)
@@ -241,6 +194,44 @@ func concatBytes(a, b []byte) []byte {
 	return c
 }
 
-func jsDataUrl(code string) string {
-	return fmt.Sprintf("data:text/javascript;base64,%s", base64.StdEncoding.EncodeToString([]byte(code)))
+// mustEncodeJSON encodes the given value to a JSON byte slice.
+func mustEncodeJSON(v interface{}) []byte {
+	buf := bytes.NewBuffer(nil)
+	err := json.NewEncoder(buf).Encode(v)
+	if err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
+}
+
+// parseJSONFile parses the given JSON file and stores the result in the value pointed to by v.
+func parseJSONFile(filename string, v interface{}) (err error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	return json.NewDecoder(file).Decode(v)
+}
+
+// run executes the given command and returns the output.
+func run(cmd string, args ...string) (output []byte, err error) {
+	var outBuf bytes.Buffer
+	var errBuf bytes.Buffer
+	c := exec.Command(cmd, args...)
+	c.Stdout = &outBuf
+	c.Stderr = &errBuf
+	err = c.Run()
+	if err != nil {
+		if errBuf.Len() > 0 {
+			err = fmt.Errorf("%s: %s", err, errBuf.String())
+		}
+		return
+	}
+	if errBuf.Len() > 0 {
+		err = fmt.Errorf("%s", errBuf.String())
+		return
+	}
+	output = outBuf.Bytes()
+	return
 }

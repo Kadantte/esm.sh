@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"net/url"
 
 	bolt "go.etcd.io/bbolt"
@@ -47,6 +48,25 @@ func (i *boltDB) Delete(key string) error {
 	return i.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(defaultBucket).Delete([]byte(key))
 	})
+}
+
+func (i *boltDB) DeleteAll(prefix string) (deletedKeys []string, err error) {
+	err = i.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(defaultBucket)
+		cursor := bucket.Cursor()
+		prefixBytes := []byte(prefix)
+		for k, _ := cursor.Seek(prefixBytes); k != nil && bytes.HasPrefix(k, prefixBytes); k, _ = cursor.Next() {
+			deletedKeys = append(deletedKeys, string(k))
+		}
+		for _, k := range deletedKeys {
+			err := bucket.Delete([]byte(k))
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return
 }
 
 func (i *boltDB) Close() error {
