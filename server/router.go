@@ -103,7 +103,7 @@ func router() rex.Handle {
 				h := sha1.New()
 				h.Write([]byte(loader))
 				h.Write([]byte(input.Code))
-				h.Write([]byte(input.ImportMap))
+				h.Write(input.ImportMap)
 				h.Write([]byte(input.Target))
 				h.Write([]byte(fmt.Sprintf("%v", input.SourceMap)))
 				hash := hex.EncodeToString(h.Sum(nil))
@@ -145,19 +145,15 @@ func router() rex.Handle {
 				ctx.W.Header().Set("Cache-Control", ccMustRevalidate)
 				return output
 			case "/purge":
-				zoneId := ctx.Form.Value("zone-id")
+				zoneId := ctx.Form.Value("zoneId")
 				packageName := ctx.Form.Value("package")
 				version := ctx.Form.Value("version")
-				github := ctx.Form.Has("github")
 				if packageName == "" {
-					return rex.Err(400, "packageName is required")
+					return rex.Err(400, "param `package` is required")
 				}
 				prefix := "/" + packageName + "@"
 				if version != "" {
 					prefix += version
-				}
-				if github {
-					prefix = "/gh" + prefix
 				}
 				if zoneId != "" {
 					prefix = zoneId + prefix
@@ -166,16 +162,59 @@ func router() rex.Handle {
 				if err != nil {
 					return rex.Err(500, err.Error())
 				}
+				deletedPkgs := NewStringSet()
 				for _, esmPath := range deletedKeys {
+					pathname := esmPath
 					if zoneId != "" {
-						esmPath = esmPath[len(zoneId):]
+						pathname = pathname[len(zoneId):]
 					}
-					pkgName, version, _, _ := splitPkgPath(esmPath)
-					go fs.RemoveAll(fmt.Sprintf("builds/%s@%s/", pkgName, version))
-					go fs.RemoveAll(fmt.Sprintf("types/%s@%s/", pkgName, version))
-					log.Info("purged", esmPath)
+					fromGithub := strings.HasPrefix(pathname, "/gh/")
+					if fromGithub {
+						pathname = pathname[3:]
+					}
+					pkgName, version, _, _ := splitPkgPath(pathname)
+					pkgId := pkgName + "@" + version
+					if fromGithub {
+						pkgId = "gh/" + pkgId
+					}
+					deletedPkgs.Add(pkgId)
 				}
-				return deletedKeys
+				deletedFiles := []string{}
+				for _, pkgId := range deletedPkgs.Values() {
+					buildPrefix := fmt.Sprintf("builds/%s", pkgId)
+					buildFiles, err := fs.List(buildPrefix)
+					if err == nil && len(buildFiles) > 0 {
+						err = fs.RemoveAll(buildPrefix)
+						if err != nil {
+							return rex.Err(500, "FS error")
+						}
+						for i, filepath := range buildFiles {
+							buildFiles[i] = fmt.Sprintf("%s/%s", pkgId, filepath)
+						}
+						deletedFiles = append(deletedFiles, buildFiles...)
+					}
+					dtsPrefix := fmt.Sprintf("types/%s", pkgId)
+					dtsFiles, err := fs.List(dtsPrefix)
+					if err == nil && len(dtsFiles) > 0 {
+						err = fs.RemoveAll(dtsPrefix)
+						if err != nil {
+							return rex.Err(500, "FS error")
+						}
+						for i, filepath := range dtsFiles {
+							dtsFiles[i] = fmt.Sprintf("%s/%s", pkgId, filepath)
+						}
+						deletedFiles = append(deletedFiles, dtsFiles...)
+					}
+					log.Info("purged", pkgId)
+				}
+				ret := map[string]interface{}{
+					"deletedPkgs":  deletedPkgs.Values(),
+					"deletedFiles": deletedFiles,
+				}
+				if zoneId != "" {
+					ret["zoneId"] = zoneId
+				}
+				return ret
 			default:
 				return rex.Err(404, "not found")
 			}
@@ -214,7 +253,7 @@ func router() rex.Handle {
 			readme = bytes.ReplaceAll(readme, []byte("./server/embed/"), []byte("/embed/"))
 			readme = bytes.ReplaceAll(readme, []byte("./HOSTING.md"), []byte("https://github.com/esm-dev/esm.sh/blob/main/HOSTING.md"))
 			readme = bytes.ReplaceAll(readme, []byte("https://esm.sh"), []byte(cdnOrigin))
-			readmeStrLit := mustEncodeJSON(string(readme))
+			readmeStrLit := utils.MustEncodeJSON(string(readme))
 			html := bytes.ReplaceAll(indexHTML, []byte("'# README'"), readmeStrLit)
 			html = bytes.ReplaceAll(html, []byte("{VERSION}"), []byte(fmt.Sprintf("%d", VERSION)))
 			header.Set("Cache-Control", ccMustRevalidate)
@@ -308,8 +347,8 @@ func router() rex.Handle {
 			pathname = regexpLocPath.ReplaceAllString(pathname, "$1")
 		}
 
-		// serve run and hot scripts
-		if pathname == "/run" || pathname == "/hot" {
+		// serve the internal script
+		if pathname == "/run" || pathname == "/sw" || pathname == "/tsx" {
 			data, err := embedFS.ReadFile(fmt.Sprintf("server/embed/%s.ts", pathname[1:]))
 			if err != nil {
 				return rex.Status(404, "Not Found")
@@ -328,7 +367,7 @@ func router() rex.Handle {
 				target = getBuildTargetByUA(userAgent)
 			}
 
-			if pathname == "/run" {
+			if pathname == "/tsx" {
 				data = bytes.ReplaceAll(data, []byte("$TARGET"), []byte(fmt.Sprintf(`"%s"`, target)))
 			}
 
@@ -348,8 +387,8 @@ func router() rex.Handle {
 					header.Set("ETag", globalETag)
 				}
 			}
-			if pathname == "/hot" {
-				header.Set("X-Typescript-Types", fmt.Sprintf("%s/hot.d.ts", cdnOrigin))
+			if pathname == "/run" || pathname == "/sw" {
+				header.Set("X-Typescript-Types", fmt.Sprintf("%s/run.d.ts", cdnOrigin))
 			}
 			return code
 		}
@@ -433,16 +472,9 @@ func router() rex.Handle {
 			return rex.Content(pathname, startTime, bytes.NewReader(code))
 		}
 
-		// use embed polyfills/types
-		if endsWith(pathname, ".js", ".d.ts") && strings.Count(pathname, "/") == 1 {
-			var data []byte
-			var err error
-			isDts := strings.HasSuffix(pathname, ".d.ts")
-			if isDts {
-				data, err = embedFS.ReadFile("server/embed/types" + pathname)
-			} else {
-				data, err = embedFS.ReadFile("server/embed/polyfills" + pathname)
-			}
+		// use embed types
+		if strings.HasSuffix(pathname, ".d.ts") && strings.Count(pathname, "/") == 1 {
+			data, err := embedFS.ReadFile("server/embed/types" + pathname)
 			if err == nil {
 				ifNoneMatch := ctx.R.Header.Get("If-None-Match")
 				if ifNoneMatch != "" && ifNoneMatch == globalETag {
@@ -456,29 +488,18 @@ func router() rex.Handle {
 						header.Set("ETag", globalETag)
 					}
 				}
-				if isDts {
-					header.Set("Content-Type", ctTypeScript)
-				} else {
-					target := getBuildTargetByUA(userAgent)
-					code, err := minify(string(data), targets[target], api.LoaderJS)
-					if err != nil {
-						return throwErrorJS(ctx, fmt.Sprintf("Transform error: %v", err), false)
-					}
-					data = []byte(code)
-					header.Set("Content-Type", ctJavaScript)
-					appendVaryHeader(header, "User-Agent")
-				}
+				header.Set("Content-Type", ctTypeScript)
 				return rex.Content(pathname, startTime, bytes.NewReader(data))
 			}
 		}
 
 		// check `/*pathname` or `/gh/*pathname` pattern
-		external := NewStringSet()
+		externalAll := false
 		if strings.HasPrefix(pathname, "/*") {
-			external.Add("*")
+			externalAll = true
 			pathname = "/" + pathname[2:]
 		} else if strings.HasPrefix(pathname, "/gh/*") {
-			external.Add("*")
+			externalAll = true
 			pathname = "/gh/" + pathname[5:]
 		}
 
@@ -530,7 +551,7 @@ func router() rex.Handle {
 			return rex.Status(status, message)
 		}
 
-		// apply _extra query_ to the url
+		// apply extra query to the url
 		if extraQuery != "" {
 			qs := []string{extraQuery}
 			if ctx.R.URL.RawQuery != "" {
@@ -546,7 +567,6 @@ func router() rex.Handle {
 		}
 
 		ghPrefix := ""
-
 		if pkg.FromGithub {
 			ghPrefix = "/gh"
 		}
@@ -631,19 +651,19 @@ func router() rex.Handle {
 		}
 
 		// redirect to the url with full package version
-		if !strings.Contains(pathname, pkg.Fullname()) {
+		if !strings.Contains(pathname, "@"+pkg.Version) {
 			if !isTargetUrl {
 				skipRedirect := caretVersion && resType == ResBare && !pkg.FromGithub
 				if !skipRedirect {
 					pkgName := pkg.Name
-					eaSign := ""
+					asteriskPrefix := ""
 					subPath := ""
 					query := ""
 					if strings.HasPrefix(pkgName, "@jsr/") {
 						pkgName = "jsr/@" + strings.ReplaceAll(pkgName[5:], "__", "/")
 					}
-					if external.Has("*") {
-						eaSign = "*"
+					if externalAll {
+						asteriskPrefix = "*"
 					}
 					if pkg.SubPath != "" {
 						subPath = "/" + pkg.SubPath
@@ -652,11 +672,11 @@ func router() rex.Handle {
 					if rawQuery := ctx.R.URL.RawQuery; rawQuery != "" {
 						if extraQuery != "" {
 							query = "&" + rawQuery
-							return rex.Redirect(fmt.Sprintf("%s%s/%s%s@%s%s%s", cdnOrigin, ghPrefix, eaSign, pkgName, pkg.Version, query, subPath), http.StatusFound)
+							return rex.Redirect(fmt.Sprintf("%s%s/%s%s@%s%s%s", cdnOrigin, ghPrefix, asteriskPrefix, pkgName, pkg.Version, query, subPath), http.StatusFound)
 						}
 						query = "?" + rawQuery
 					}
-					return rex.Redirect(fmt.Sprintf("%s%s/%s%s@%s%s%s", cdnOrigin, ghPrefix, eaSign, pkgName, pkg.Version, subPath, query), http.StatusFound)
+					return rex.Redirect(fmt.Sprintf("%s%s/%s%s@%s%s%s", cdnOrigin, ghPrefix, asteriskPrefix, pkgName, pkg.Version, subPath, query), http.StatusFound)
 				}
 			} else {
 				subPath := ""
@@ -677,7 +697,7 @@ func router() rex.Handle {
 			buf := &bytes.Buffer{}
 			wasmUrl := cdnOrigin + pathname
 			fmt.Fprintf(buf, "/* esm.sh - wasm module */\n")
-			fmt.Fprintf(buf, "const data = await fetch(%s).then(r => r.arrayBuffer());\nexport default new WebAssembly.Module(data);", strings.TrimSpace(string(mustEncodeJSON(wasmUrl))))
+			fmt.Fprintf(buf, "const data = await fetch(%s).then(r => r.arrayBuffer());\nexport default new WebAssembly.Module(data);", strings.TrimSpace(string(utils.MustEncodeJSON(wasmUrl))))
 			header.Set("Cache-Control", ccImmutable)
 			header.Set("Content-Type", ctJavaScript)
 			return buf
@@ -686,9 +706,9 @@ func router() rex.Handle {
 		// fix url that is related to `import.meta.url`
 		if resType == ResRaw && isTargetUrl && !query.Has("raw") {
 			extname := path.Ext(pkg.SubPath)
-			dir := path.Join(npmrc.Dir(), pkg.Fullname())
+			dir := path.Join(npmrc.NpmDir(), pkg.Fullname())
 			if !existsDir(dir) {
-				err := npmrc.installPackage(pkg)
+				_, err := npmrc.installPackage(pkg)
 				if err != nil {
 					return rex.Status(500, err.Error())
 				}
@@ -729,14 +749,14 @@ func router() rex.Handle {
 
 		// serve package raw files
 		if resType == ResRaw {
-			savePath := path.Join(npmrc.Dir(), pkg.Fullname(), "node_modules", pkg.Name, pkg.SubPath)
+			savePath := path.Join(npmrc.NpmDir(), pkg.Fullname(), "node_modules", pkg.Name, pkg.SubPath)
 			fi, err := os.Lstat(savePath)
 			if err != nil {
 				if os.IsExist(err) {
 					return rex.Status(500, err.Error())
 				}
 				// if the file not found, try to install the package
-				err = npmrc.installPackage(pkg)
+				_, err = npmrc.installPackage(pkg)
 				if err != nil {
 					return rex.Status(500, err.Error())
 				}
@@ -851,7 +871,7 @@ func router() rex.Handle {
 						return rex.Status(400, fmt.Sprintf("Invalid deps query: %v not found", v))
 					}
 					if pkg.Name == "react-dom" && p.Name == "react" {
-						// the `react` version always matches `react-dom` version
+						// make sure react-dom and react are in the same version
 						continue
 					}
 					if p.Name != pkg.Name {
@@ -894,11 +914,12 @@ func router() rex.Handle {
 		}
 
 		// check `?external` query
+		external := NewStringSet()
 		for _, p := range strings.Split(query.Get("external"), ",") {
 			p = strings.TrimSpace(p)
 			if p == "*" {
 				external.Reset()
-				external.Add("*")
+				externalAll = true
 				break
 			}
 			if p != "" {
@@ -907,11 +928,12 @@ func router() rex.Handle {
 		}
 
 		buildArgs := BuildArgs{
-			alias:      alias,
-			conditions: conditions,
-			deps:       deps,
-			exports:    exports,
-			external:   external,
+			alias:       alias,
+			conditions:  conditions,
+			deps:        deps,
+			exports:     exports,
+			externalAll: externalAll,
+			external:    external,
 		}
 
 		// check if the build args from pathname: `PKG@VERSION/X-${args}/esnext/SUBPATH`
@@ -922,7 +944,7 @@ func router() rex.Handle {
 				pkg.SubModule = strings.Join(a[1:], "/")
 				args, err := decodeBuildArgs(npmrc, strings.TrimPrefix(a[0], "X-"))
 				if err != nil {
-					return throwErrorJS(ctx, err.Error(), false)
+					return throwErrorJS(ctx, "Invalid build args: "+a[0], false)
 				}
 				pkg.SubPath = strings.Join(strings.Split(pkg.SubPath, "/")[1:], "/")
 				pkg.SubModule = toModuleBareName(pkg.SubPath, true)
@@ -931,7 +953,15 @@ func router() rex.Handle {
 			}
 		}
 
-		// build and return dts
+		// fix the build args that are from the query
+		if !isBuildArgsFromPath {
+			err := fixBuildArgs(npmrc, &buildArgs, pkg)
+			if err != nil {
+				return throwErrorJS(ctx, err.Error(), false)
+			}
+		}
+
+		// build and return `.d.ts`
 		if resType == ResTypes {
 			findDts := func() (savePath string, fi storage.FileStat, err error) {
 				args := ""
@@ -991,11 +1021,11 @@ func router() rex.Handle {
 			// check `?jsx-rutnime` query
 			var jsxRuntime *Pkg = nil
 			if v := query.Get("jsx-runtime"); v != "" {
-				m, _, _, _, err := validateESMPath(npmrc, v)
+				p, _, _, _, err := validateESMPath(npmrc, v)
 				if err != nil {
 					return rex.Status(400, fmt.Sprintf("Invalid jsx-runtime query: %v not found", v))
 				}
-				jsxRuntime = &m
+				jsxRuntime = &p
 			}
 
 			externalRequire := query.Has("external-require")
@@ -1203,7 +1233,7 @@ func router() rex.Handle {
 func throwErrorJS(ctx *rex.Context, message string, static bool) interface{} {
 	buf := bytes.NewBuffer(nil)
 	fmt.Fprintf(buf, "/* esm.sh - error */\n")
-	fmt.Fprintf(buf, "throw new Error(%s);\n", strings.TrimSpace(string(mustEncodeJSON(strings.TrimSpace("[esm.sh] "+message)))))
+	fmt.Fprintf(buf, "throw new Error(%s);\n", strings.TrimSpace(string(utils.MustEncodeJSON(strings.TrimSpace("[esm.sh] "+message)))))
 	fmt.Fprintf(buf, "export default null;\n")
 	if static {
 		ctx.W.Header().Set("Cache-Control", ccImmutable)

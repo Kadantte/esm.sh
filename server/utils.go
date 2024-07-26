@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -118,12 +117,10 @@ func findFiles(root string, dir string, fn func(p string) bool) ([]string, error
 			if err != nil {
 				return nil, err
 			}
-			n := len(files)
-			files = make([]string, n+len(subFiles))
-			for i, f := range subFiles {
-				files[i+n] = f
-			}
-			copy(files, subFiles)
+			newFiles := make([]string, len(files)+len(subFiles))
+			copy(newFiles, files)
+			copy(newFiles[len(files):], subFiles)
+			files = newFiles
 		} else {
 			if fn(path) {
 				files = append(files, path)
@@ -192,26 +189,6 @@ func concatBytes(a, b []byte) []byte {
 	copy(c, a)
 	copy(c[len(a):], b)
 	return c
-}
-
-// mustEncodeJSON encodes the given value to a JSON byte slice.
-func mustEncodeJSON(v interface{}) []byte {
-	buf := bytes.NewBuffer(nil)
-	err := json.NewEncoder(buf).Encode(v)
-	if err != nil {
-		panic(err)
-	}
-	return buf.Bytes()
-}
-
-// parseJSONFile parses the given JSON file and stores the result in the value pointed to by v.
-func parseJSONFile(filename string, v interface{}) (err error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-	return json.NewDecoder(file).Decode(v)
 }
 
 // run executes the given command and returns the output.

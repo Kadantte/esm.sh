@@ -64,6 +64,15 @@ const R2 = {
   ): Promise<void> {
     this._store.set(key, { value: await new Response(value).arrayBuffer(), ...options });
   },
+  async delete(key: string | string[]): Promise<void> {
+    if (Array.isArray(key)) {
+      for (const k of key) {
+        this._store.delete(k);
+      }
+    } else {
+      this._store.delete(key);
+    }
+  },
 };
 
 const LEGACY_WORKER = {
@@ -199,13 +208,13 @@ Deno.test("esm-worker", { sanitizeOps: false, sanitizeResources: false }, async 
     assertEquals(typeof ret.version, "number");
   });
 
-  await t.step("embed polyfills/types", async () => {
-    const res2 = await fetch(`${workerOrigin}/hot.d.ts`);
+  await t.step("embed scripts/polyfills/types", async () => {
+    const res2 = await fetch(`${workerOrigin}/run.d.ts`);
     assertEquals(res2.status, 200);
     assertEquals(res2.headers.get("Content-Type"), "application/typescript; charset=utf-8");
     assertEquals(res2.headers.get("Etag"), `W/"${version}"`);
     assertEquals(res2.headers.get("Cache-Control"), "public, max-age=86400");
-    assertStringIncludes(await res2.text(), "export interface Hot");
+    assertStringIncludes(await res2.text(), "export interface RunOptions");
 
     const res3 = await fetch(`${workerOrigin}/node/process.js`);
     assertEquals(res3.status, 200);
@@ -231,14 +240,6 @@ Deno.test("esm-worker", { sanitizeOps: false, sanitizeResources: false }, async 
     assertEquals(res6.status, 200);
     assertEquals(res6.headers.get("Content-Type"), "application/javascript; charset=utf-8");
     assertEquals(res6.headers.get("Cache-Control"), "public, max-age=31536000, immutable");
-
-    const res7 = await fetch(`${workerOrigin}/npm_node-fetch.js`);
-    assertEquals(res7.status, 200);
-    assertEquals(res7.headers.get("Content-Type"), "application/javascript; charset=utf-8");
-    assertEquals(res7.headers.get("Etag"), `W/"${version}"`);
-    assertEquals(res7.headers.get("Cache-Control"), "public, max-age=86400");
-    assertStringIncludes(res7.headers.get("Vary")!, "User-Agent");
-    assertStringIncludes(await res7.text(), "fetch");
 
     const fs = await import(`${workerOrigin}/node/fs.js`);
     fs.writeFileSync("foo.txt", "bar", "utf8");
@@ -299,11 +300,13 @@ Deno.test("esm-worker", { sanitizeOps: false, sanitizeResources: false }, async 
     assertEquals(res9.status, 200);
     assertStringIncludes(await res9.text(), `from "react"`);
 
-    const res10 = await fetch(`${workerOrigin}/typescript@5.4.2/es2022/typescript.mjs`);
+    const res10 = await fetch(`${workerOrigin}/typescript@5.5.4/es2022/typescript.mjs`);
+    const js = await res10.text();
     assertEquals(res10.status, 200);
-    assertStringIncludes(await res10.text(), `"/node/process.js"`);
+    assertStringIncludes(js, `__Process$`);
+    assert(!js.includes("/node/process.js"));
 
-    const res11 = await fetch(`${workerOrigin}/typescript@5.4.2/es2022/typescript.mjs.map`);
+    const res11 = await fetch(`${workerOrigin}/typescript@5.5.4/es2022/typescript.mjs.map`);
     assertEquals(res11.status, 200);
     assertEquals(res11.headers.get("Content-Type"), "application/json; charset=utf-8");
   });
@@ -434,9 +437,9 @@ Deno.test("esm-worker", { sanitizeOps: false, sanitizeResources: false }, async 
   });
 
   await t.step("builtin scripts", async () => {
-    const res = await fetch(`${workerOrigin}/hot`);
+    const res = await fetch(`${workerOrigin}/run`);
     res.body?.cancel();
-    assertEquals(new URL(res.url).pathname, "/hot");
+    assertEquals(new URL(res.url).pathname, "/run");
     assertEquals(res.headers.get("Etag"), `W/"${version}"`);
     assertEquals(res.headers.get("Cache-Control"), "public, max-age=86400");
     assertEquals(res.headers.get("Content-Type"), "application/javascript; charset=utf-8");
@@ -445,18 +448,18 @@ Deno.test("esm-worker", { sanitizeOps: false, sanitizeResources: false }, async 
     assert(dtsUrl.startsWith(workerOrigin));
     assert(dtsUrl.endsWith(".d.ts"));
 
-    const res2 = await fetch(`${workerOrigin}/hot?target=es2022`);
+    const res2 = await fetch(`${workerOrigin}/run?target=es2022`);
     assertEquals(res2.headers.get("Etag"), `W/"${version}"`);
     assertEquals(res2.headers.get("Cache-Control"), "public, max-age=86400");
     assertEquals(res2.headers.get("Content-Type"), "application/javascript; charset=utf-8");
-    assertStringIncludes(await res2.text(), "esm.sh/hot");
+    assertStringIncludes(await res2.text(), "esm.sh/run");
 
-    const res3 = await fetch(`${workerOrigin}/run`);
+    const res3 = await fetch(`${workerOrigin}/tsx`);
     assertEquals(res3.headers.get("Etag"), `W/"${version}"`);
     assertEquals(res3.headers.get("Cache-Control"), "public, max-age=86400");
     assertEquals(res3.headers.get("Content-Type"), "application/javascript; charset=utf-8");
     assertStringIncludes(res3.headers.get("Vary") ?? "", "User-Agent");
-    assertStringIncludes(await res3.text(), "esm.sh/run");
+    assertStringIncludes(await res3.text(), "esm.sh/tsx");
   });
 
   await t.step("transform api", async () => {
@@ -467,15 +470,15 @@ Deno.test("esm-worker", { sanitizeOps: false, sanitizeResources: false }, async 
       `,
       filename: "source.jsx",
       target: "es2022",
-      importMap: JSON.stringify({
+      importMap: {
         imports: {
           "@jsxImportSource": "https://preact@10.13.2",
           "preact-render-to-string": "https://esm.sh/preact-render-to-string6.0.2",
         },
-      }),
+      },
       sourceMap: true,
     };
-    const hash = await computeHash("jsx" + options.code + options.importMap + options.target + options.sourceMap);
+    const hash = await computeHash("jsx" + options.code + JSON.stringify(options.importMap) + options.target + options.sourceMap);
     const res1 = await fetch(`${workerOrigin}/transform`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -514,10 +517,11 @@ Deno.test("esm-worker", { sanitizeOps: false, sanitizeResources: false }, async 
       body: fd,
     });
     assertEquals(res.status, 200);
-    assertEquals(res.headers.get("Content-Type"), "application/json; charset=utf-8");
-    const ret = await res.json();
-    assert(Array.isArray(ret));
-    assert(ret.length > 0);
+    const ret: any = await res.json();
+    assert(Array.isArray(ret.deletedPkgs));
+    assert(Array.isArray(ret.deletedFiles));
+    assert(ret.deletedPkgs.length > 0);
+    assert(ret.deletedFiles.length > 0);
   });
 
   await t.step("check esma target from user agent", async () => {
@@ -548,7 +552,7 @@ Deno.test("esm-worker", { sanitizeOps: false, sanitizeResources: false }, async 
         "/react@18.2.0",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
       ),
-      "/es2022/",
+      "/es2023/",
     );
     assertStringIncludes(
       await fetchModule(

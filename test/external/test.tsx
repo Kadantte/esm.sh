@@ -4,7 +4,7 @@ import { h } from "preact";
 import render from "preact-render-to-string";
 import useSWR from "swr";
 
-Deno.test("external", () => {
+Deno.test("preact with swr via ?external", () => {
   const fetcher = (url: string) => fetch(url).then((res) => res.json());
   const App = () => {
     const { data } = useSWR("http://localhost:8080/status.json", fetcher, {
@@ -25,6 +25,16 @@ Deno.test("external", () => {
   };
   const html = render(<App />);
   assertEquals(html, "<main><p>just now</p></main>");
+});
+
+Deno.test("strip invalid ?external", async () => {
+  const res1 = await fetch("http://localhost:8080/react-dom@18.3.1?target=es2022&external=foo,bar,react");
+  const code1 = await res1.text();
+  assertStringIncludes(code1, '"/react-dom@18.3.1/X-ZXJlYWN0/es2022/react-dom.mjs"');
+
+  const res2 = await fetch("http://localhost:8080/react-dom@18.3.1?target=es2022&external=foo,bar,preact");
+  const code2 = await res2.text();
+  assertStringIncludes(code2, '"/react-dom@18.3.1/es2022/react-dom.mjs"');
 });
 
 Deno.test("types with ?external", async () => {

@@ -12,28 +12,30 @@ A global, fast & smart content delivery network(CDN) for modern(es2015+) web dev
 
 ## How to Use
 
-esm.sh allows you to import [JavaScirpt(ES6) modules](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Modules) from NPM/GitHub in browser. No installation/build steps needed.
+esm.sh allows you to import [JavaScript ES modules](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Modules) on [NPM](https://npmjs.com), [GitHub](https://github.com), and [JSR](https://jsr.io) with a simple URL. **No installation/build steps needed.**
 
 ```js
 import * as mod from "https://esm.sh/PKG[@SEMVER][/PATH]";
 ```
 
-With [import maps](https://github.com/WICG/import-maps), you can even use bare import specifiers intead of full URLs.
+With [import maps](https://github.com/WICG/import-maps), you can even use bare import specifiers intead of URLs:
 
 ```html
 <script type="importmap">
 {
   "imports": {
     "react": "https://esm.sh/react@18.2.0"
+    "react-dom/": "https://esm.sh/react-dom@18.2.0/"
   }
 }
 </script>
 <script type="module">
-  import React from "react" // alias to https://esm.sh/react@18.2.0
+  import React from "react"; // → https://esm.sh/react@18.2.0
+  import { render } from "react-dom/client"; // → https://esm.sh/react-dom@18.2.0/client
 </script>
 ```
 
-> More details check out [here](#using-import-maps).
+> More details about the import map usage can be found in the [**Using Import Maps**](#using-import-maps) section.
 
 ### Supported Registries
 
@@ -45,18 +47,18 @@ With [import maps](https://github.com/WICG/import-maps), you can even use bare i
   import React from "https://esm.sh/react@beta"; // 19.0.0-beta-94eed63c49-20240425
   import { renderToString } from "https://esm.sh/react-dom@18.3.0/server"; // submodules
   ```
-- **[Github](https://github.com)** (starts with `/gh/`):
+- **[GitHub](https://github.com)** (starts with `/gh/`):
   ```js
   // Examples
-  import tslib from "https://esm.sh/gh/microsoft/tslib@2.6.0"; // '2.6.0' is the git tag name
+  import tslib from "https://esm.sh/gh/microsoft/tslib@2.6.0"; // '2.6.0' is the git tag
   // or fetch an asset file from github
   fetch("https://esm.sh/gh/microsoft/fluentui-emoji/assets/Party%20popper/Color/party_popper_color.svg");
   ```
 - **[JSR](https://jsr.io)** (starts with `/jsr/`):
   ```js
   // Examples
-  import * as mod from "https://esm.sh/jsr/@std/encoding@0.222.0/base64";
-  import { html } from "https://esm.sh/jsr/@mark/html@1";
+  import { encodeBase64 } from "https://esm.sh/jsr/@std/encoding@1.0.0/base64";
+  import { Hono } from "https://esm.sh/jsr/@hono/hono@4";
   ```
 
 ### Specifying Dependencies
@@ -81,8 +83,6 @@ in combination with `?deps`:
 ```js
 import useSWR from "https://esm.sh/swr?alias=react:preact/compat&deps=preact@10.5.14";
 ```
-
-The original idea came from [@lucacasonato](https://github.com/lucacasonato).
 
 ### Tree Shaking
 
@@ -221,15 +221,23 @@ const { exports } = new WebAssembly.Instance(wasm, imports);
 [**Import Maps**](https://github.com/WICG/import-maps) has been supported by most modern browsers and Deno natively.
 This allows _**bare import specifiers**_, such as `import React from "react"`, to work.
 
-esm.sh introduces the `?external=foo,bar` query for specifying external dependencies. By employing this query, esm.sh maintains the import specifier intact, leaving it to the browser/Deno to resolve based on the import map. For example:
+esm.sh introduces the `?external` for specifying external dependencies. By employing this query, esm.sh maintains the import specifier intact, leaving it to the browser/Deno to resolve based on the import map. For example:
 
-```json
+```html
+<script type="importmap">
 {
   "imports": {
     "preact": "https://esm.sh/preact@10.7.2",
+    "preact/": "https://esm.sh/preact@10.7.2/",
     "preact-render-to-string": "https://esm.sh/preact-render-to-string@5.2.0?external=preact"
   }
 }
+</script>
+<script type="module">
+  import { h } from "preact";
+  import { useState } from "preact/hooks";
+  import { render } from "preact-render-to-string";
+</script>
 ```
 
 Alternatively, you can **mark all dependencies as external** by adding a `*` prefix before the package name:

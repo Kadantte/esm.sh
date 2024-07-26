@@ -169,7 +169,7 @@ func (ctx *BuildContext) Build() (ret BuildResult, err error) {
 	if ctx.zoneId != "" {
 		key = ctx.zoneId + key
 	}
-	if e := db.Put(key, mustEncodeJSON(ret)); e != nil {
+	if e := db.Put(key, utils.MustEncodeJSON(ret)); e != nil {
 		log.Errorf("db: %v", e)
 	}
 	return
@@ -177,23 +177,19 @@ func (ctx *BuildContext) Build() (ret BuildResult, err error) {
 
 func (ctx *BuildContext) install() (err error) {
 	if ctx.wd == "" || ctx.pkgJson.Name == "" {
-		err = ctx.npmrc.installPackage(ctx.pkg)
+		var pkgJson PackageJSON
+		pkgJson, err = ctx.npmrc.installPackage(ctx.pkg)
 		if err != nil {
 			return
 		}
-		ctx.wd = path.Join(ctx.npmrc.Dir(), ctx.pkg.Fullname())
+		ctx.pkgJson = ctx.normalizePackageJSON(pkgJson)
+		ctx.wd = path.Join(ctx.npmrc.NpmDir(), ctx.pkg.Fullname())
 		ctx.pkgDir = path.Join(ctx.wd, "node_modules", ctx.pkg.Name)
 		if rp, e := os.Readlink(ctx.pkgDir); e == nil {
 			ctx.pnpmPkgDir = path.Join(path.Dir(ctx.pkgDir), rp)
 		} else {
 			ctx.pnpmPkgDir = ctx.pkgDir
 		}
-		var pkgJson PackageJSON
-		err = parseJSONFile(path.Join(ctx.pkgDir, "package.json"), &pkgJson)
-		if err != nil {
-			return
-		}
-		ctx.pkgJson = ctx.normalizePackageJSON(pkgJson)
 	}
 	return
 }
@@ -232,7 +228,7 @@ func (ctx *BuildContext) buildModule() (result BuildResult, err error) {
 	typesOnly := strings.HasPrefix(ctx.pkgJson.Name, "@types/") || (entry.esm == "" && entry.cjs == "" && entry.dts != "")
 	if typesOnly {
 		result.TypesOnly = true
-		result.Dts = "/" + ctx.pkg.ghPrefix() + ctx.pkg.Fullname() + entry.dts[1:]
+		result.Dts = "/" + ctx.pkg.Fullname() + entry.dts[1:]
 		ctx.transformDTS(entry.dts)
 		return
 	}
@@ -382,8 +378,12 @@ func (ctx *BuildContext) buildModule() (result BuildResult, err error) {
 
 					// it's implicit external
 					if implicitExternal.Has(args.Path) {
+						externalPath, err := ctx.resolveExternalModule(args.Path, args.Kind)
+						if err != nil {
+							return api.OnResolveResult{}, err
+						}
 						return api.OnResolveResult{
-							Path:     ctx.resolveExternalModule(args.Path, args.Kind),
+							Path:     externalPath,
 							External: true,
 						}, nil
 					}
@@ -448,10 +448,11 @@ func (ctx *BuildContext) buildModule() (result BuildResult, err error) {
 						}
 					}
 
-					// use polyfilled 'fsevents' module for browser
+					// use the polyfilled 'fsevents' module for browser
 					if specifier == "fsevents" && ctx.isBrowserTarget() {
+						data := npmPolyfills[specifier]
 						return api.OnResolveResult{
-							Path:     "npm_fsevents.js",
+							Path:     fmt.Sprintf("data:text/javascript;base64,%s", base64.StdEncoding.EncodeToString(data)),
 							External: true,
 						}, nil
 					}
@@ -513,8 +514,12 @@ func (ctx *BuildContext) buildModule() (result BuildResult, err error) {
 					// externalize the _parent_ module
 					// e.g. "react/jsx-runtime" imports "react"
 					if ctx.pkg.SubModule != "" && specifier == ctx.pkg.Name && ctx.bundleMode != BundleAll {
+						externalPath, err := ctx.resolveExternalModule(ctx.pkg.Name, args.Kind)
+						if err != nil {
+							return api.OnResolveResult{}, err
+						}
 						return api.OnResolveResult{
-							Path:        ctx.resolveExternalModule(ctx.pkg.Name, args.Kind),
+							Path:        externalPath,
 							External:    true,
 							SideEffects: pkgSideEffects,
 						}, nil
@@ -522,8 +527,12 @@ func (ctx *BuildContext) buildModule() (result BuildResult, err error) {
 
 					// it's nodejs internal module
 					if nodejsInternalModules[specifier] {
+						externalPath, err := ctx.resolveExternalModule(specifier, args.Kind)
+						if err != nil {
+							return api.OnResolveResult{}, err
+						}
 						return api.OnResolveResult{
-							Path:     ctx.resolveExternalModule(specifier, args.Kind),
+							Path:     externalPath,
 							External: true,
 						}, nil
 					}
@@ -599,8 +608,12 @@ func (ctx *BuildContext) buildModule() (result BuildResult, err error) {
 										}, nil
 									}
 									if !isRelativeSpecifier(path) {
+										externalPath, err := ctx.resolveExternalModule(path, args.Kind)
+										if err != nil {
+											return api.OnResolveResult{}, err
+										}
 										return api.OnResolveResult{
-											Path:     ctx.resolveExternalModule(path, args.Kind),
+											Path:     externalPath,
 											External: true,
 										}, nil
 									}
@@ -644,8 +657,12 @@ func (ctx *BuildContext) buildModule() (result BuildResult, err error) {
 											exportPrefix, _ := utils.SplitByLastByte(exportName, '*')
 											exportModuleName := path.Join(ctx.pkgJson.Name, exportPrefix+strings.TrimPrefix(bareName, prefix))
 											if exportModuleName != entryModuleSpecifier && exportModuleName != entryModuleSpecifier+"/index" {
+												externalPath, err := ctx.resolveExternalModule(exportModuleName, args.Kind)
+												if err != nil {
+													return api.OnResolveResult{}, err
+												}
 												return api.OnResolveResult{
-													Path:        ctx.resolveExternalModule(exportModuleName, args.Kind),
+													Path:        externalPath,
 													External:    true,
 													SideEffects: pkgSideEffects,
 												}, nil
@@ -671,8 +688,12 @@ func (ctx *BuildContext) buildModule() (result BuildResult, err error) {
 										if match {
 											exportModuleName := path.Join(ctx.pkgJson.Name, stripModuleExt(exportName))
 											if exportModuleName != entryModuleSpecifier && exportModuleName != entryModuleSpecifier+"/index" {
+												externalPath, err := ctx.resolveExternalModule(exportModuleName, args.Kind)
+												if err != nil {
+													return api.OnResolveResult{}, err
+												}
 												return api.OnResolveResult{
-													Path:        ctx.resolveExternalModule(exportModuleName, args.Kind),
+													Path:        externalPath,
 													External:    true,
 													SideEffects: pkgSideEffects,
 												}, nil
@@ -702,8 +723,12 @@ func (ctx *BuildContext) buildModule() (result BuildResult, err error) {
 										if len(p) == 3 && string(p[0]) == "export*from" && string(p[2]) == ";\n" {
 											url := string(p[1])
 											if !isRelativeSpecifier(url) {
+												externalPath, err := ctx.resolveExternalModule(url, args.Kind)
+												if err != nil {
+													return api.OnResolveResult{}, err
+												}
 												return api.OnResolveResult{
-													Path:        ctx.resolveExternalModule(url, args.Kind),
+													Path:        externalPath,
 													External:    true,
 													SideEffects: pkgSideEffects,
 												}, nil
@@ -729,8 +754,12 @@ func (ctx *BuildContext) buildModule() (result BuildResult, err error) {
 					if specifier == ctx.pkgJson.Name || specifier == ctx.pkgJson.PkgName || strings.HasPrefix(specifier, ctx.pkgJson.Name+"/") || strings.HasPrefix(specifier, ctx.pkgJson.Name+"/") {
 						sideEffects = pkgSideEffects
 					}
+					externalPath, err := ctx.resolveExternalModule(specifier, args.Kind)
+					if err != nil {
+						return api.OnResolveResult{}, err
+					}
 					return api.OnResolveResult{
-						Path:        ctx.resolveExternalModule(specifier, args.Kind),
+						Path:        externalPath,
 						External:    true,
 						SideEffects: sideEffects,
 					}, nil
@@ -922,7 +951,7 @@ func (ctx *BuildContext) buildModule() (result BuildResult, err error) {
 	if !ctx.isDenoTarget() {
 		options.JSX = api.JSXAutomatic
 		if ctx.args.jsxRuntime != nil {
-			if ctx.args.external.Has(ctx.args.jsxRuntime.Name) || ctx.args.external.Has("*") {
+			if ctx.args.external.Has(ctx.args.jsxRuntime.Name) || ctx.args.externalAll {
 				options.JSXImportSource = ctx.args.jsxRuntime.Name
 			} else {
 				options.JSXImportSource = "/" + ctx.args.jsxRuntime.String()
@@ -931,7 +960,7 @@ func (ctx *BuildContext) buildModule() (result BuildResult, err error) {
 			options.JSXImportSource = "react"
 		} else if ctx.args.external.Has("preact") {
 			options.JSXImportSource = "preact"
-		} else if ctx.args.external.Has("*") {
+		} else if ctx.args.externalAll {
 			options.JSXImportSource = "react"
 		} else if pkgVersion, ok := ctx.args.deps["react"]; ok {
 			options.JSXImportSource = "/react@" + pkgVersion
@@ -1022,34 +1051,22 @@ rebuild:
 					ids.Add(string(r))
 				}
 				if ids.Has("__Process$") {
-					if ctx.args.external.Has("node:process") || ctx.args.external.Has("*") {
+					if ctx.args.external.Has("node:process") || ctx.args.externalAll {
 						fmt.Fprintf(header, `import __Process$ from "node:process";%s`, EOL)
+					} else if ctx.isBrowserTarget() {
+						if len(ctx.pkgJson.Browser) == 0 {
+							fmt.Fprintf(header, `import __Process$ from "/node/process.js";%s`, EOL)
+							imports.Add("/node/process.js")
+						}
 					} else if ctx.target == "denonext" {
 						fmt.Fprintf(header, `import __Process$ from "node:process";%s`, EOL)
 					} else if ctx.target == "deno" {
 						fmt.Fprintf(header, `import __Process$ from "https://deno.land/std@0.177.1/node/process.ts";%s`, EOL)
-					} else if ctx.isBrowserTarget() {
-						var browserExclude bool
-						if len(ctx.pkgJson.Browser) > 0 {
-							if name, ok := ctx.pkgJson.Browser["process"]; ok {
-								browserExclude = name == ""
-							} else if name, ok := ctx.pkgJson.Browser["node:process"]; ok {
-								browserExclude = name == ""
-							}
-						}
-						if !browserExclude {
-							fmt.Fprintf(header, `import __Process$ from "/node/process.js";%s`, EOL)
-							imports.Add("/node/process.js")
-						}
 					}
 				}
 				if ids.Has("__Buffer$") {
-					if ctx.args.external.Has("node:buffer") || ctx.args.external.Has("*") {
+					if ctx.args.external.Has("node:buffer") || ctx.args.externalAll {
 						fmt.Fprintf(header, `import { Buffer as __Buffer$ } from "node:buffer";%s`, EOL)
-					} else if ctx.target == "denonext" {
-						fmt.Fprintf(header, `import { Buffer as __Buffer$ } from "node:buffer";%s`, EOL)
-					} else if ctx.target == "deno" {
-						fmt.Fprintf(header, `import { Buffer as __Buffer$ } from "https://deno.land/std@0.177.1/node/buffer.ts";%s`, EOL)
 					} else if ctx.isBrowserTarget() {
 						var browserExclude bool
 						if len(ctx.pkgJson.Browser) > 0 {
@@ -1063,6 +1080,10 @@ rebuild:
 							fmt.Fprintf(header, `import { Buffer as __Buffer$ } from "/node/buffer.js";%s`, EOL)
 							imports.Add("/node/buffer.js")
 						}
+					} else if ctx.target == "denonext" {
+						fmt.Fprintf(header, `import { Buffer as __Buffer$ } from "node:buffer";%s`, EOL)
+					} else if ctx.target == "deno" {
+						fmt.Fprintf(header, `import { Buffer as __Buffer$ } from "https://deno.land/std@0.177.1/node/buffer.ts";%s`, EOL)
 					}
 				}
 				if ids.Has("__global$") {
@@ -1261,7 +1282,7 @@ func (ctx *BuildContext) buildTypes() (ret BuildResult, err error) {
 	ctx.stage = "build"
 	err = ctx.transformDTS(dts)
 	if err == nil {
-		ret.Dts = "/" + ctx.pkg.ghPrefix() + ctx.pkg.Fullname() + dts[1:]
+		ret.Dts = "/" + ctx.pkg.Fullname() + dts[1:]
 	}
 	return
 }

@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/esm-dev/esm.sh/server/storage"
+	"github.com/ije/gox/utils"
 )
 
 // transformDTS transforms a `.d.ts` file for deno/editor-lsp
@@ -17,7 +18,7 @@ func transformDTS(ctx *BuildContext, dts string, buildArgsPrefix string, marker 
 	if isRoot {
 		marker = NewStringSet()
 	}
-	dtsPath := path.Join("/"+ctx.pkg.ghPrefix(), ctx.pkg.Fullname(), buildArgsPrefix, dts)
+	dtsPath := path.Join("/"+ctx.pkg.Fullname(), buildArgsPrefix, dts)
 	if marker.Has(dtsPath) {
 		// don't transform repeatly
 		return
@@ -67,7 +68,7 @@ func transformDTS(ctx *BuildContext, dts string, buildArgsPrefix string, marker 
 			if !endsWith(specifier, ".d.ts", ".d.mts") {
 				var p PackageJSON
 				var hasTypes bool
-				if parseJSONFile(path.Join(dtsWD, specifier, "package.json"), &p) == nil {
+				if utils.ParseJSONFile(path.Join(dtsWD, specifier, "package.json"), &p) == nil {
 					dir := path.Join("/", path.Dir(dts))
 					if p.Types != "" {
 						specifier, _ = relPath(dir, "/"+path.Join(dir, specifier, p.Types))
@@ -124,8 +125,7 @@ func transformDTS(ctx *BuildContext, dts string, buildArgsPrefix string, marker 
 		if depPkgName == ctx.pkg.Name {
 			if strings.ContainsRune(subPath, '*') {
 				return fmt.Sprintf(
-					"{ESM_CDN_ORIGIN}/%s%s/%s%s",
-					ctx.pkg.ghPrefix(),
+					"{ESM_CDN_ORIGIN}/%s/%s%s",
 					ctx.pkg.Fullname(),
 					ctx.getBuildArgsPrefix(ctx.pkg, true),
 					subPath,
@@ -140,8 +140,7 @@ func transformDTS(ctx *BuildContext, dts string, buildArgsPrefix string, marker 
 				entry := ctx.resolveEntry(depPkg)
 				if entry.dts != "" {
 					return fmt.Sprintf(
-						"{ESM_CDN_ORIGIN}/%s%s/%s%s",
-						ctx.pkg.ghPrefix(),
+						"{ESM_CDN_ORIGIN}/%s/%s%s",
 						ctx.pkg.Fullname(),
 						ctx.getBuildArgsPrefix(ctx.pkg, true),
 						strings.TrimPrefix(entry.dts, "./"),
@@ -170,7 +169,7 @@ func transformDTS(ctx *BuildContext, dts string, buildArgsPrefix string, marker 
 		}
 
 		// respect `?external` query
-		if ctx.args.external.Has("*") || ctx.args.external.Has(depPkgName) {
+		if ctx.args.externalAll || ctx.args.external.Has(depPkgName) {
 			return specifier, nil
 		}
 
