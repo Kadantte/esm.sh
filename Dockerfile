@@ -1,23 +1,34 @@
-# Build Stage
-FROM golang:1.22-alpine AS build-stage
+# build >>>
+FROM golang:1.26-alpine AS builder
+
+ARG SERVER_VERSION="main"
 
 RUN apk update && apk add --no-cache git
-RUN git clone --depth 1 https://github.com/esm-dev/esm.sh /tmp/esm.sh
+RUN git clone --branch $SERVER_VERSION --depth 1 https://github.com/esm-dev/esm.sh /tmp/esm.sh
 
 WORKDIR /tmp/esm.sh
-RUN CGO_ENABLED=0 GOOS=linux go build -o esmd main.go
+RUN go build -ldflags="-s -w -X 'github.com/esm-dev/esm.sh/server.VERSION=${SERVER_VERSION}'" -o esmd server/esmd/main.go
+# <<< build
 
-# Release Stage
-FROM node:22-alpine AS release-stage
+FROM alpine:latest
 
-RUN apk update && apk add --no-cache git libcap-utils
-RUN npm i -g pnpm
+RUN apk update && apk add --no-cache git
+RUN addgroup -g 1000 esm && adduser -u 1000 --home=/esm -G esm -D esm
 
-COPY --from=build-stage /tmp/esm.sh/esmd /bin/esmd
-RUN setcap cap_net_bind_service=ep /bin/esmd
-RUN chown node:node /bin/esmd
+COPY --from=builder /tmp/esm.sh/esmd /bin/esmd
+COPY --from=denoland/deno:bin-2.7.13 --chown=esm:esm /deno /esm/bin/deno
 
-USER node
-WORKDIR /tmp
-EXPOSE 8080
+# deno doesn't provide musl build yet, the hack below makes the gnu build working in alpine
+# see https://github.com/denoland/deno_docker/blob/main/alpine.dockerfile
+COPY --from=gcr.io/distroless/cc --chown=root:root --chmod=755 /lib/*-linux-gnu/* /usr/local/lib/
+COPY --from=gcr.io/distroless/cc --chown=root:root --chmod=755 /lib/ld-linux-* /lib/
+RUN mkdir /lib64 && ln -s /usr/local/lib/ld-linux-* /lib64/
+
+ENV DENO_USE_CGROUPS=1
+ENV LD_LIBRARY_PATH="/usr/local/lib"
+ENV ESMDIR="/esm"
+
+WORKDIR /esm
+EXPOSE 80
+USER esm
 CMD ["esmd"]

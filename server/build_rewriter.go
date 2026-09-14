@@ -8,27 +8,12 @@ import (
 	"regexp"
 )
 
-var regReadTailwindPreflightCSS = regexp.MustCompile(`[a-zA-Z.]+\.readFileSync\(.+?/preflight\.css"\),\s*"utf-?8"\)`)
-
-// unsupported node modules for `denonext` target
-var denoNextUnspportedNodeModules = map[string]bool{
-	"inspector": true,
-}
-
-// force to use `npm:` specifier for `denonext` target to support node native module or fix `createRequire` issue
-var forceNpmSpecifiers = map[string]bool{
-	"@achingbrain/ssdp": true,
-	"aws-crt":           true,
-	"default-gateway":   true,
-	"fsevent":           true,
-	"lightningcss":      true,
-	"re2":               true,
-	"zlib-sync":         true,
-	"css-tree":          true,
-}
+var (
+	regReadTailwindPreflightCSS = regexp.MustCompile(`[a-zA-Z.]+\.readFileSync\(.+?/preflight\.css"\),\s*"utf-?8"\)`)
+)
 
 func (ctx *BuildContext) rewriteJS(in []byte) (out []byte, dropSourceMap bool) {
-	switch ctx.pkg.Name {
+	switch ctx.esmPath.PkgName {
 	case "axios", "cross-fetch", "whatwg-fetch":
 		if ctx.isDenoTarget() {
 			xhr := []byte("\nimport \"https://deno.land/x/xhr@0.3.0/mod.ts\";")
@@ -46,7 +31,7 @@ func (ctx *BuildContext) rewriteJS(in []byte) (out []byte, dropSourceMap bool) {
 		}
 
 	case "iconv-lite":
-		if ctx.isDenoTarget() && semverLessThan(ctx.pkg.Version, "0.5.0") {
+		if ctx.isDenoTarget() && semverLessThan(ctx.esmPath.PkgVersion, "0.5.0") {
 			old := "__Process$.versions.node"
 			new := "__Process$.versions.nope"
 			return bytes.Replace(in, []byte(old), []byte(new), 1), false
@@ -55,16 +40,28 @@ func (ctx *BuildContext) rewriteJS(in []byte) (out []byte, dropSourceMap bool) {
 	return in, false
 }
 
-func (ctx *BuildContext) rewriteDTS(dts string, in []byte) []byte {
-	// fix preact/compat types
-	if ctx.pkg.Name == "preact" && dts == "./compat/src/index.d.ts" {
-		if !bytes.Contains(in, []byte("export type PropsWithChildren")) {
-			return bytes.ReplaceAll(
-				in,
-				[]byte("export import ComponentProps = preact.ComponentProps;"),
-				[]byte("export import ComponentProps = preact.ComponentProps;\n\n// added by esm.sh\nexport type PropsWithChildren<P = unknown> = P & { children?: preact.ComponentChildren };"),
-			)
+func (ctx *BuildContext) rewriteDTS(filename string, buf *bytes.Buffer) *bytes.Buffer {
+	switch ctx.esmPath.PkgName {
+	case "preact":
+		// fix preact/compat types
+		if filename == "./compat/src/index.d.ts" {
+			dts := buf.Bytes()
+			if !bytes.Contains(dts, []byte("export type PropsWithChildren")) {
+				return bytes.NewBuffer(bytes.ReplaceAll(
+					dts,
+					[]byte("export import ComponentProps = preact.ComponentProps;"),
+					[]byte("export import ComponentProps = preact.ComponentProps;\n\n// added by esm.sh\nexport type PropsWithChildren<P = unknown> = P & { children?: preact.ComponentChildren };"),
+				))
+			}
 		}
+	case "@rollup/plugin-commonjs":
+		dts := buf.Bytes()
+		// see https://github.com/denoland/deno/issues/27492
+		return bytes.NewBuffer(bytes.ReplaceAll(
+			dts,
+			[]byte("[package: string]: ReadonlyArray<string>"),
+			[]byte("[name   : string]: ReadonlyArray<string>"),
+		))
 	}
-	return in
+	return buf
 }

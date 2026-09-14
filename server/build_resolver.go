@@ -2,140 +2,1112 @@ package server
 
 import (
 	"crypto/sha1"
-	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
-	"net/url"
+	"os"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 
-	"github.com/evanw/esbuild/pkg/api"
+	"github.com/esm-dev/esm.sh/internal/npm"
+	esbuild "github.com/ije/esbuild-internal/api"
+	esbuild_config "github.com/ije/esbuild-internal/config"
+	"github.com/ije/esbuild-internal/js_ast"
+	"github.com/ije/esbuild-internal/js_parser"
+	"github.com/ije/esbuild-internal/logger"
 	"github.com/ije/gox/utils"
 )
 
+var moduleExts = []string{".js", ".ts", ".mjs", ".mts", ".jsx", ".tsx", ".cjs", ".cts"}
+
 // BuildEntry represents the build entrypoints of a module
 type BuildEntry struct {
-	esm string
-	cjs string
-	dts string
+	main   string
+	module bool
+	types  string
 }
 
-// isEmpty checks if the entry is empty
 func (entry *BuildEntry) isEmpty() bool {
-	return entry.esm == "" && entry.cjs == "" && entry.dts == ""
+	return entry.main == "" && entry.types == ""
 }
 
-// hasEntry checks if the entrypoint of the given type exists
-func (entry *BuildEntry) hasEntry(entryType string) bool {
-	switch entryType {
-	case "esm":
-		return entry.esm != ""
-	case "cjs":
-		return entry.cjs != ""
-	case "dts":
-		return entry.dts != ""
-	}
-	return false
+func (entry *BuildEntry) isTypesOnly() bool {
+	return entry.main == "" && entry.types != ""
 }
 
-// updateEntry updates the entrypoint of the given type
-func (entry *BuildEntry) updateEntry(entryType string, entryPath string) {
-	switch entryType {
-	case "esm":
-		entry.esm = entryPath
-	case "cjs":
-		entry.cjs = entryPath
-	case "dts":
-		entry.dts = entryPath
-	}
+func (entry *BuildEntry) update(main string, module bool) {
+	entry.main = main
+	entry.module = module || strings.HasSuffix(main, ".mjs")
 }
 
-// resolve resolves the entrypoint of the given type
-func (entry *BuildEntry) resolve(ctx *BuildContext, mType string, condition interface{}, entryType string) {
-	if entry.hasEntry(entryType) {
-		return
-	}
-	if s, ok := condition.(string); ok {
-		entry.updateEntry(entryType, s)
-	} else if om, ok := condition.(*OrderedMap); ok {
-		if v, ok := om.m["default"]; ok {
-			if s, ok := v.(string); ok && s != "" {
-				entry.updateEntry(entryType, s)
+func (ctx *BuildContext) resolveEntry(esm EsmPath) (entry BuildEntry) {
+	pkgJson := ctx.pkgJson
+
+	if subPath := esm.SubPath; subPath != "" {
+		if endsWith(subPath, ".d.ts", ".d.mts", ".d.cts") {
+			entry.types = normalizeEntryPath(subPath)
+			return
+		}
+
+		switch ext := path.Ext(subPath); ext {
+		case ".mts", ".ts", ".tsx", ".cts", ".json", ".jsx", ".svelte", ".vue", ".css":
+			if ctx.existsPkgFile(subPath) {
+				switch ext {
+				case ".mts", ".ts", ".tsx", ".cts":
+					// todo: create dts from the ts file
+					entry.update(subPath, true)
+					// lookup jsr built dts
+					if strings.HasPrefix(esm.PkgName, "@jsr/") {
+						for _, v := range pkgJson.Exports.Values() {
+							if obj, ok := v.(npm.JSONObject); ok {
+								if v, ok := obj.Get("default"); ok {
+									if s, ok := v.(string); ok && s == "./"+stripModuleExt(subPath)+".js" {
+										if v, ok := obj.Get("types"); ok {
+											if s, ok := v.(string); ok {
+												entry.types = normalizeEntryPath(s)
+											}
+										}
+										break
+									}
+								}
+							}
+						}
+					}
+					return
+				case ".json", ".jsx", ".svelte", ".vue":
+					entry.update(subPath, true)
+					return
+				case ".css":
+					// check if CSS file is defined in exports
+					if pkgJson.Exports.Len() > 0 {
+						if v, ok := pkgJson.Exports.Get("./" + subPath); ok {
+							if s, ok := v.(string); ok {
+								entry.update(s, true)
+								return
+							}
+							if obj, ok := v.(npm.JSONObject); ok {
+								// handle conditional exports like {"types": "...", "default": "..."}
+								if defaultPath, ok := obj.Get("default"); ok {
+									if s, ok := defaultPath.(string); ok {
+										entry.update(s, true)
+										return
+									}
+								}
+							}
+						}
+					}
+					// if not found in exports, use the subPath as-is
+					entry.update(subPath, true)
+					return
+				}
 			}
 		}
-		e := ctx.resolveConditionExportEntry(om, mType)
-		if e.esm != "" && !entry.hasEntry("esm") {
-			entry.updateEntry("esm", e.esm)
+
+		// reslove sub-module using `exports` conditions if exists
+		// see https://nodejs.org/api/packages.html#package-entry-points
+		if pkgJson.Exports.Len() > 0 {
+			var exportEntry BuildEntry
+			conditions, ok := pkgJson.Exports.Get("./" + subPath)
+			if ok {
+				if s, ok := conditions.(string); ok {
+					/**
+					exports: {
+						"./lib/foo": "./lib/foo.js"
+					}
+					*/
+					exportEntry.update(s, pkgJson.Type == "module")
+				} else if obj, ok := conditions.(npm.JSONObject); ok {
+					/**
+					exports: {
+						"./lib/foo": {
+							"require": "./lib/foo.js",
+							"import": "./esm/foo.js",
+							"types": "./types/foo.d.ts"
+						}
+					}
+					*/
+					exportEntry = ctx.resolveConditionExportEntry(obj, pkgJson.Type)
+				}
+			} else {
+				for _, name := range pkgJson.Exports.Keys() {
+					conditions, _ := pkgJson.Exports.Get(name)
+					if stripEntryModuleExt(name) == "./"+subPath {
+						if s, ok := conditions.(string); ok {
+							/**
+							exports: {
+								"./lib/foo.js": "./lib/foo.js"
+							}
+							*/
+							exportEntry.update(s, pkgJson.Type == "module")
+						} else if obj, ok := conditions.(npm.JSONObject); ok {
+							/**
+							exports: {
+								"./lib/foo.js": {
+									"require": "./lib/foo.js",
+									"import": "./esm/foo.js",
+									"types": "./types/foo.d.ts"
+								}
+							}
+							*/
+							exportEntry = ctx.resolveConditionExportEntry(obj, pkgJson.Type)
+						}
+						break
+					} else if diff, ok := matchAsteriskExport(name, subPath); ok {
+						if s, ok := conditions.(string); ok {
+							/**
+							exports: {
+								"./lib/*": "./dist/lib/*.js",
+							}
+							*/
+							path := strings.ReplaceAll(s, "*", diff)
+							if endsWith(path, ".mjs", ".js", ".cjs") {
+								if ctx.existsPkgFile(path) {
+									exportEntry.update(path, pkgJson.Type == "module")
+									break
+								}
+							} else if p := path + ".mjs"; ctx.existsPkgFile(p) {
+								exportEntry.update(p, true)
+								break
+							} else if p := path + ".js"; ctx.existsPkgFile(p) {
+								exportEntry.update(p, pkgJson.Type == "module")
+								break
+							} else if p := path + ".cjs"; ctx.existsPkgFile(p) {
+								exportEntry.update(p, false)
+								break
+							} else if p := path + "/index.mjs"; ctx.existsPkgFile(p) {
+								exportEntry.update(p, true)
+								break
+							} else if p := path + "/index.js"; ctx.existsPkgFile(p) {
+								exportEntry.update(p, pkgJson.Type == "module")
+								break
+							} else if p := path + "/index.cjs"; ctx.existsPkgFile(p) {
+								exportEntry.update(p, false)
+								break
+							}
+						} else if obj, ok := conditions.(npm.JSONObject); ok {
+							/**
+							exports: {
+								"./lib/*": {
+									"require": ".dist/lib/dist/*.js",
+									"import": ".dist/lib/esm/*.js",
+									"types": ".dist/lib/types/*.d.ts"
+								},
+							}
+							*/
+							exportEntry = ctx.resolveConditionExportEntry(resloveAsteriskPathMapping(obj, diff), pkgJson.Type)
+							ctx.finalizeBuildEntry(&exportEntry)
+							if !exportEntry.isEmpty() {
+								break
+							}
+						}
+					}
+				}
+			}
+			if mainJs, ok := ctx.resloveSubModule(exportEntry.main); ok {
+				entry.update(mainJs, exportEntry.module)
+			}
+			if exportEntry.types != "" && ctx.existsPkgFile(exportEntry.types) {
+				entry.types = exportEntry.types
+			}
 		}
-		if e.cjs != "" && !entry.hasEntry("cjs") {
-			entry.updateEntry("cjs", e.cjs)
+
+		// check if the sub-module is a directory and has a package.json
+		var rawInfo npm.PackageJSONRaw
+		if utils.ParseJSONFile(path.Join(ctx.wd, "node_modules", ctx.esmPath.PkgName, subPath, "package.json"), &rawInfo) == nil {
+			p := rawInfo.ToNpmPackage()
+			if entry.main == "" {
+				if p.Module != "" && ctx.existsPkgFile(subPath, p.Module) {
+					entry.update("./"+path.Join(subPath, p.Module), true)
+				} else if p.Main != "" && ctx.existsPkgFile(subPath, p.Main) {
+					entry.update("./"+path.Join(subPath, p.Main), p.Type == "module")
+				}
+			}
+			if entry.types == "" {
+				if p.Types != "" && ctx.existsPkgFile(subPath, p.Types) {
+					entry.types = "./" + path.Join(subPath, p.Types)
+				}
+			}
 		}
-		if e.dts != "" && !entry.hasEntry("dts") {
-			entry.updateEntry("dts", e.dts)
+
+		// lookup entry from the sub-module directory if it's not defined in `package.json`
+		if entry.main == "" {
+			for _, ext := range []string{"mjs", "js", "cjs", "mts", "ts", "tsx", "cts"} {
+				isModule := ext == "mjs" || ext == "mts" || ext == "ts" || (ext == "js" && pkgJson.Type == "module")
+				if filename := "./" + subPath + "." + ext; ctx.existsPkgFile(filename) {
+					entry.update(filename, isModule)
+					break
+				} else if filename := "./" + subPath + "/index." + ext; ctx.existsPkgFile(filename) {
+					entry.update(filename, isModule)
+					break
+				}
+			}
 		}
+
+		if entry.main == "" && ctx.pkgJson.Imports.Len() > 0 {
+			if v, ok := ctx.pkgJson.Imports.Get(ctx.pkgJson.PkgName + "/*"); ok {
+				if s, ok := v.(string); ok && strings.HasSuffix(s, "/*") {
+					for _, ext := range []string{"mjs", "js", "cjs", "mts", "ts", "tsx", "cts"} {
+						isModule := ext == "mjs" || ext == "mts" || ext == "ts" || (ext == "js" && pkgJson.Type == "module")
+						if filename := strings.TrimSuffix(s, "*") + subPath + "." + ext; ctx.existsPkgFile(filename) {
+							entry.update(filename, isModule)
+							break
+						} else if filename := strings.TrimSuffix(s, "*") + subPath + "/index." + ext; ctx.existsPkgFile(filename) {
+							entry.update(filename, isModule)
+							break
+						}
+					}
+				}
+			}
+		}
+
+		// lookup entry main from `src` directory
+		if entry.main == "" && esm.GhPrefix {
+			for _, ext := range []string{"mts", "ts", "mjs", "js", "tsx", "cts", "cjs"} {
+				isModule := ext != "cjs" && ext != "cts"
+				if filename := "./src/" + subPath + "/index." + ext; ctx.existsPkgFile(filename) {
+					entry.update(filename, isModule)
+					break
+				} else if filename := "./" + subPath + "/src/index." + ext; ctx.existsPkgFile(filename) {
+					entry.update(filename, isModule)
+					break
+				}
+			}
+		}
+
+		if entry.types == "" {
+			if entry.main != "" && ctx.existsPkgFile(stripModuleExt(entry.main)+".d.mts") {
+				entry.types = stripModuleExt(entry.main) + ".d.mts"
+			} else if entry.main != "" && ctx.existsPkgFile(stripModuleExt(entry.main)+".d.ts") {
+				entry.types = stripModuleExt(entry.main) + ".d.ts"
+			} else if entry.main != "" && ctx.existsPkgFile(stripModuleExt(entry.main)+".d.cts") {
+				entry.types = stripModuleExt(entry.main) + ".d.cts"
+			} else if ctx.existsPkgFile(subPath + ".d.mts") {
+				entry.types = "./" + subPath + ".d.mts"
+			} else if ctx.existsPkgFile(subPath + ".d.ts") {
+				entry.types = "./" + subPath + ".d.ts"
+			} else if ctx.existsPkgFile(subPath + ".d.cts") {
+				entry.types = "./" + subPath + ".d.cts"
+			} else if ctx.existsPkgFile(subPath, "index.d.mts") {
+				entry.types = "./" + subPath + "/index.d.mts"
+			} else if ctx.existsPkgFile(subPath, "index.d.ts") {
+				entry.types = "./" + subPath + "/index.d.ts"
+			} else if ctx.existsPkgFile(subPath, "index.d.cts") {
+				entry.types = "./" + subPath + "/index.d.cts"
+			}
+		}
+	} else {
+		if pkgJson.Module != "" && ctx.existsPkgFile(pkgJson.Module) {
+			entry.update(pkgJson.Module, true)
+		} else if pkgJson.Main != "" {
+			entry.update(pkgJson.Main, pkgJson.Type == "module")
+		}
+		if pkgJson.Types != "" {
+			entry.types = normalizeEntryPath(pkgJson.Types)
+		}
+		if len(pkgJson.Browser) > 0 && ctx.isBrowserTarget() {
+			if path, ok := pkgJson.Browser["."]; ok && ctx.existsPkgFile(path) {
+				entry.update(path, pkgJson.Type == "module")
+			}
+		}
+
+		if exports := pkgJson.Exports; exports.Len() > 0 {
+			exportEntry := BuildEntry{}
+			v, ok := exports.Get(".")
+			if ok {
+				if s, ok := v.(string); ok {
+					/**
+					exports: {
+						".": "./index.js"
+					}
+					*/
+					exportEntry.update(s, pkgJson.Type == "module")
+				} else if obj, ok := v.(npm.JSONObject); ok {
+					/**
+					exports: {
+						".": {
+							"require": "./cjs/index.js",
+							"import": "./esm/index.js"
+						}
+					}
+					*/
+					exportEntry = ctx.resolveConditionExportEntry(obj, pkgJson.Type)
+				} else if arr, ok := v.([]any); ok {
+					/**
+					exports: {
+						".": ["./cjs/index.js", "./esm/index.js"]
+					}
+					*/
+					a0 := arr[0]
+					if s, ok := a0.(string); ok {
+						exportEntry.update(s, pkgJson.Type == "module")
+					} else if obj, ok := a0.(npm.JSONObject); ok {
+						exportEntry = ctx.resolveConditionExportEntry(obj, pkgJson.Type)
+					}
+				}
+			} else {
+				/**
+				exports: {
+					"require": "./cjs/index.js",
+					"import": "./esm/index.js"
+				}
+				*/
+				exportEntry = ctx.resolveConditionExportEntry(exports, pkgJson.Type)
+			}
+			if exportEntry.main != "" && ctx.existsPkgFile(exportEntry.main) {
+				entry.update(exportEntry.main, exportEntry.module)
+			}
+			if exportEntry.types != "" && ctx.existsPkgFile(exportEntry.types) {
+				entry.types = exportEntry.types
+			}
+		}
+
+		// lookup entry from the package directory if it's not defined in `package.json`
+		if entry.main == "" {
+			if ctx.existsPkgFile("index.mjs") {
+				entry.update("./index.mjs", true)
+			} else if ctx.existsPkgFile("index.js") {
+				entry.update("./index.js", pkgJson.Type == "module")
+			} else if ctx.existsPkgFile("index.cjs") {
+				entry.update("./index.cjs", false)
+			}
+		}
+
+		// lookup entry main from `src` directory
+		if entry.main == "" && esm.GhPrefix {
+			for _, ext := range []string{"mts", "ts", "mjs", "js", "tsx", "cts", "cjs"} {
+				filename := "./src/index." + ext
+				if ctx.existsPkgFile(filename) {
+					entry.update(filename, ext != "cjs" && ext != "cts")
+					break
+				}
+			}
+		}
+
+		if entry.types == "" {
+			if ctx.existsPkgFile("index.d.mts") {
+				entry.types = "./index.d.mts"
+			} else if ctx.existsPkgFile("index.d.ts") {
+				entry.types = "./index.d.ts"
+			} else if ctx.existsPkgFile("index.d.cts") {
+				entry.types = "./index.d.cts"
+			}
+		}
+
+		if entry.types == "" && entry.main != "" {
+			if ctx.existsPkgFile(stripModuleExt(entry.main) + ".d.mts") {
+				entry.types = stripModuleExt(entry.main) + ".d.mts"
+			} else if ctx.existsPkgFile(stripModuleExt(entry.main) + ".d.ts") {
+				entry.types = stripModuleExt(entry.main) + ".d.ts"
+			} else if ctx.existsPkgFile(stripModuleExt(entry.main) + ".d.cts") {
+				entry.types = stripModuleExt(entry.main) + ".d.cts"
+			} else if stripModuleExt(path.Base(entry.main)) == "index" {
+				dir, _ := utils.SplitByLastByte(entry.main, '/')
+				if ctx.existsPkgFile(dir, "index.d.mts") {
+					entry.types = dir + "/index.d.mts"
+				} else if ctx.existsPkgFile(dir, "index.d.ts") {
+					entry.types = dir + "/index.d.ts"
+				} else if ctx.existsPkgFile(dir, "index.d.cts") {
+					entry.types = dir + "/index.d.cts"
+				}
+			}
+		}
+	}
+
+	// resolve entry main from `browser` field if it's defined
+	if len(pkgJson.Browser) > 0 && ctx.isBrowserTarget() {
+		if entry.main != "" {
+			if path, ok := pkgJson.Browser[entry.main]; ok && ctx.existsPkgFile(path) {
+				entry.update(path, pkgJson.Type == "module")
+			}
+		}
+	}
+
+	// resolve types from `typesVersions` field if it's defined
+	// see https://www.typescriptlang.org/docs/handbook/declaration-files/publishing.html#version-selection-with-typesversions
+	if typesVersions := pkgJson.TypesVersions; len(typesVersions) > 0 && entry.types != "" {
+		versions := make(sort.StringSlice, len(typesVersions))
+		i := 0
+		for c := range typesVersions {
+			if strings.HasPrefix(c, ">") {
+				versions[i] = c
+				i++
+			}
+		}
+		versions = versions[:i]
+		if versions.Len() > 0 {
+			versions.Sort()
+			latestVersion := typesVersions[versions[versions.Len()-1]]
+			if mapping, ok := latestVersion.(map[string]any); ok {
+				var paths any
+				var matched bool
+				var exact bool
+				var suffix string
+				types := entry.types
+				paths, matched = mapping[entry.types]
+				if !matched {
+					// try to match the dts wihout leading "./"
+					paths, matched = mapping[strings.TrimPrefix(types, "./")]
+				}
+				if matched {
+					exact = true
+				}
+				if !matched {
+					for key, value := range mapping {
+						if strings.HasSuffix(key, "/*") {
+							key = normalizeEntryPath(key)
+							if strings.HasPrefix(types, strings.TrimSuffix(key, "/*")) {
+								paths = value
+								matched = true
+								suffix = strings.TrimPrefix(types, strings.TrimSuffix(key, "*"))
+								break
+							}
+						}
+					}
+				}
+				if !matched {
+					paths, matched = mapping["*"]
+				}
+				if matched {
+					if a, ok := paths.([]any); ok && len(a) > 0 {
+						if path, ok := a[0].(string); ok {
+							path = normalizeEntryPath(path)
+							if exact {
+								entry.types = path
+							} else {
+								prefix, _ := utils.SplitByLastByte(path, '*')
+								if suffix != "" {
+									entry.types = prefix + suffix
+								} else if after, ok0 := strings.CutPrefix(types, prefix); ok0 {
+									diff := after
+									entry.types = strings.ReplaceAll(path, "*", diff)
+								} else {
+									entry.types = prefix + types[2:]
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	ctx.finalizeBuildEntry(&entry)
+	return
+}
+
+// normalizes the build entry
+func (ctx *BuildContext) finalizeBuildEntry(entry *BuildEntry) {
+	if entry.main != "" {
+		entry.main = normalizeEntryPath(entry.main)
+		if !ctx.existsPkgFile(entry.main) {
+			preferedExt := ".cjs"
+			if entry.module {
+				preferedExt = ".mjs"
+			}
+			if ctx.existsPkgFile(entry.main + preferedExt) {
+				entry.main = entry.main + preferedExt
+			} else if ctx.existsPkgFile(entry.main + ".js") {
+				entry.main = entry.main + ".js"
+			} else if ctx.existsPkgFile(entry.main, "index"+preferedExt) {
+				entry.main = entry.main + "/index" + preferedExt
+			} else if ctx.existsPkgFile(entry.main, "index.js") {
+				entry.main = entry.main + "/index.js"
+			} else {
+				entry.main = ""
+			}
+		} else if !entry.module && endsWith(entry.main, ".js", ".ts") {
+			// check if the cjs entry is an ESM
+			isESM, _, err := validateJSFile(path.Join(ctx.wd, "node_modules", ctx.esmPath.PkgName, entry.main))
+			if err == nil {
+				entry.module = isESM
+			}
+		}
+	}
+
+	if entry.types != "" {
+		entry.types = normalizeEntryPath(entry.types)
+		if endsWith(entry.types, ".js", ".mjs", ".cjs") {
+			bearName := stripModuleExt(entry.types)
+			if ctx.existsPkgFile(bearName + ".d.mts") {
+				entry.types = bearName + ".d.mts"
+			} else if ctx.existsPkgFile(bearName + ".d.ts") {
+				entry.types = bearName + ".d.ts"
+			} else if ctx.existsPkgFile(bearName + ".d.cts") {
+				entry.types = bearName + ".d.cts"
+			} else {
+				entry.types = ""
+			}
+		} else if strings.HasSuffix(entry.types, ".d") {
+			if ctx.existsPkgFile(entry.types + ".mts") {
+				entry.types += ".mts"
+			} else if ctx.existsPkgFile(entry.types + ".ts") {
+				entry.types += ".ts"
+			} else if ctx.existsPkgFile(entry.types + ".cts") {
+				entry.types += ".cts"
+			} else {
+				entry.types = ""
+			}
+		} else if !endsWith(entry.types, ".d.ts", ".d.mts", ".d.cts") {
+			if ctx.existsPkgFile(entry.types + ".d.mts") {
+				entry.types = entry.types + ".d.mts"
+			} else if ctx.existsPkgFile(entry.types + ".d.ts") {
+				entry.types = entry.types + ".d.ts"
+			} else if ctx.existsPkgFile(entry.types + ".d.cts") {
+				entry.types = entry.types + ".d.cts"
+			} else if ctx.existsPkgFile(entry.types, "index.d.mts") {
+				entry.types = entry.types + "/index.d.mts"
+			} else if ctx.existsPkgFile(entry.types, "index.d.ts") {
+				entry.types = entry.types + "/index.d.ts"
+			} else if ctx.existsPkgFile(entry.types, "index.d.cts") {
+				entry.types = entry.types + "/index.d.cts"
+			} else {
+				entry.types = ""
+			}
+		} else if !ctx.existsPkgFile(entry.types) {
+			entry.types = ""
+		}
+	} else if ext := path.Ext(entry.main); ext == ".mts" || ext == ".ts" || ext == ".tsx" || ext == ".cts" {
+		// entry.types = strings.TrimSuffix(entry.main, ext) + ".d" + strings.TrimSuffix(ext,"x")
 	}
 }
 
-func (ctx *BuildContext) Path() string {
-	if ctx.path != "" {
-		return ctx.path
+// see https://nodejs.org/api/packages.html#nested-conditions
+func (ctx *BuildContext) resolveConditionExportEntry(conditions npm.JSONObject, preferedModuleType string) (entry BuildEntry) {
+	if preferedModuleType == "types" {
+		for _, conditionName := range []string{"module", "import", "es2015", "default", "require"} {
+			condition, ok := conditions.Get(conditionName)
+			if ok {
+				if s, ok := condition.(string); ok {
+					if entry.types == "" || endsWith(s, ".d.ts", ".d.mts", ".d.cts", ".d") {
+						entry.types = s
+					}
+				} else if obj, ok := condition.(npm.JSONObject); ok {
+					entry = ctx.resolveConditionExportEntry(obj, "types")
+				}
+				break
+			}
+		}
+		return
 	}
 
-	pkg := ctx.pkg
-	if ctx.target == "types" {
-		if strings.HasSuffix(pkg.SubPath, ".d.ts") {
-			ctx.path = fmt.Sprintf(
-				"/%s/%s%s",
-				pkg.Fullname(),
-				ctx.getBuildArgsPrefix(pkg, true),
-				pkg.SubPath,
-			)
+	applyCondition := func(conditionName string) bool {
+		condition, ok := conditions.Get(conditionName)
+		if ok {
+			if s, ok := condition.(string); ok {
+				entry.update(s, preferedModuleType == "module")
+				return true
+			} else if obj, ok := condition.(npm.JSONObject); ok {
+				entry = ctx.resolveConditionExportEntry(obj, preferedModuleType)
+				return entry.main != ""
+			}
+		}
+		return false
+	}
+
+	var conditionFound bool
+
+	if ctx.isBrowserTarget() {
+		conditionName := "browser"
+		// [workaround] fix astring entry in browser
+		if ctx.esmPath.PkgName == "astring" {
+			conditionName = "import"
+		}
+		conditionFound = applyCondition(conditionName)
+	} else if ctx.isDenoTarget() {
+		conditionName := "deno"
+		// [workaround] to support solid-js/ssr in Deno, use `node` condition for < 1.6.0
+		if ctx.esmPath.PkgName == "solid-js" && semverLessThan(ctx.esmPath.PkgVersion, "1.6.0") {
+			conditionName = "node"
+		}
+		conditionFound = applyCondition(conditionName)
+	} else if ctx.target == "node" {
+		conditionFound = applyCondition("node")
+	}
+
+	if len(ctx.args.Conditions) > 0 {
+		for _, conditionName := range ctx.args.Conditions {
+			conditionFound = applyCondition(conditionName)
+			if conditionFound {
+				break
+			}
+		}
+	} else if ctx.dev {
+		conditionFound = applyCondition("development")
+	}
+
+LOOP:
+	for _, conditionName := range conditions.Keys() {
+		condition, _ := conditions.Get(conditionName)
+		module := false
+		prefered := ""
+		switch conditionName {
+		case "import", "module", "es2015":
+			module = true
+			prefered = "module"
+		case "require":
+			module = false
+			prefered = "commonjs"
+		case "default":
+			prefered = preferedModuleType
+			if prefered != "module" {
+				if s, ok := condition.(string); ok && strings.HasSuffix(s, ".mjs") {
+					prefered = "module"
+				} else if _, ok := conditions.Get("require"); ok {
+					prefered = "module"
+				}
+			}
+			module = prefered == "module"
+		case "types", "typings":
+			if s, ok := condition.(string); ok {
+				if entry.types == "" || (!strings.HasSuffix(entry.types, ".d.mts") && strings.HasSuffix(s, ".d.mts")) {
+					entry.types = s
+				}
+			} else if obj, ok := condition.(npm.JSONObject); ok {
+				e := ctx.resolveConditionExportEntry(obj, "types")
+				if e.types != "" {
+					if entry.types == "" || (!strings.HasSuffix(entry.types, ".d.mts") && strings.HasSuffix(e.types, ".d.mts")) {
+						entry.types = e.types
+					}
+				}
+			}
+			continue LOOP
+		default:
+			// skip unknown condition
+			continue LOOP
+		}
+		if entry.main == "" || (!entry.module && module && !conditionFound) {
+			if s, ok := condition.(string); ok {
+				entry.update(s, module)
+			} else if obj, ok := condition.(npm.JSONObject); ok {
+				e := ctx.resolveConditionExportEntry(obj, prefered)
+				if e.main != "" {
+					entry.update(e.main, e.module)
+				}
+				if e.types != "" {
+					entry.types = e.types
+				}
+			}
+		}
+	}
+
+	return
+}
+
+func (ctx *BuildContext) resolveExternalModule(specifier string, kind esbuild.ResolveKind, withTypeJSON bool, analyzeMode bool) (resolvedPath string, sideEffects esbuild.SideEffects, err error) {
+	if strings.HasPrefix(specifier, "file:") {
+		err = errors.New("file: protocol is not supported: " + specifier)
+		return
+	}
+
+	// a relative path specifier is not a valid external module, and would be
+	// mis-parsed as an npm package named ".." by the dependency resolver below
+	if isRelPathSpecifier(specifier) {
+		err = errors.New("could not resolve \"" + specifier + "\"")
+		return
+	}
+
+	// return the specifier directly in analyze mode
+	if analyzeMode {
+		resolvedPath = specifier
+		return
+	}
+
+	defer func() {
+		if err == nil && !withTypeJSON {
+			resolvedPathFull := resolvedPath
+			// use relative path for sub-module of current package
+			if pkgJson := ctx.pkgJson; specifier == pkgJson.Name || strings.HasPrefix(specifier, pkgJson.Name+"/") {
+				rp, err := relPath(path.Dir(ctx.Path()), resolvedPath)
+				if err == nil {
+					resolvedPath = rp
+				}
+			}
+			if kind == esbuild.ResolveJSRequireCall {
+				ctx.cjsRequires = append(ctx.cjsRequires, [3]string{specifier, resolvedPathFull, resolvedPath})
+				resolvedPath = specifier
+			} else if kind == esbuild.ResolveJSImportStatement && !withTypeJSON {
+				ctx.esmImports = append(ctx.esmImports, [2]string{resolvedPathFull, resolvedPath})
+			}
+		}
+	}()
+
+	// if it's a http module
+	if isHttpSpecifier(specifier) {
+		resolvedPath = specifier
+		return
+	}
+
+	// check `?external`
+	packageName := toPackageName(specifier)
+	if ctx.externalAll || ctx.args.External.Has(packageName) || isPackageInExternalNamespace(packageName, ctx.args.External) {
+		resolvedPath = specifier
+		return
+	}
+
+	// if it's a node builtin module
+	if isNodeBuiltinSpecifier(specifier) {
+		if ctx.externalAll || ctx.target == "node" || ctx.target == "denonext" || ctx.args.External.Has(specifier) {
+			resolvedPath = specifier
+		} else if ctx.target == "deno" {
+			resolvedPath = fmt.Sprintf("https://deno.land/std@0.177.1/node/%s.ts", specifier[5:])
 		} else {
-			ctx.path = "/" + pkg.String()
+			resolvedPath = fmt.Sprintf("/node/%s.mjs", specifier[5:])
 		}
-		return ctx.path
+		return
 	}
 
-	name := strings.TrimSuffix(path.Base(pkg.Name), ".js")
-	extname := ".mjs"
+	// if it's `main` entry of current package
+	// Also handles scoped fork self-reference: e.g. `@scope/three` source importing `three`
+	// when `three` is not declared as a dependency — treat as self-reference.
+	pkgJson := ctx.pkgJson
+	isSelfRef := specifier == pkgJson.Name || specifier == pkgJson.PkgName
+	if !isSelfRef && strings.HasPrefix(pkgJson.Name, "@") {
+		_, baseName := utils.SplitByFirstByte(pkgJson.Name[1:], '/')
+		if specifier == baseName {
+			_, inDeps := pkgJson.Dependencies[baseName]
+			_, inPeerDeps := pkgJson.PeerDependencies[baseName]
+			if !inDeps && !inPeerDeps {
+				isSelfRef = true
+			}
+		}
+	}
+	if isSelfRef {
+		esmPath := EsmPath{
+			GhPrefix:   ctx.esmPath.GhPrefix,
+			PrPrefix:   ctx.esmPath.PrPrefix,
+			PkgName:    pkgJson.Name,
+			PkgVersion: pkgJson.Version,
+		}
+		if ctx.pkgJson.SideEffectsFalse {
+			sideEffects = esbuild.SideEffectsFalse
+		} else if ctx.pkgJson.SideEffects.Len() > 0 {
+			entry := ctx.resolveEntry(esmPath)
+			if entry.main != "" && !ctx.pkgJson.SideEffects.Has(entry.main) && !ctx.pkgJson.SideEffects.Has(strings.TrimPrefix(entry.main, "./")) {
+				sideEffects = esbuild.SideEffectsFalse
+			}
+		}
+		resolvedPath = ctx.getImportPath(esmPath, ctx.getBuildArgsPrefix(false), ctx.externalAll)
+		return
+	}
 
-	if pkg.SubModule != "" {
-		name = pkg.SubModule
-		extname = ".js"
-		// workaround for es5-ext weird "/#/" path
-		if pkg.Name == "es5-ext" {
-			name = strings.ReplaceAll(name, "/#/", "/%23/")
+	// if it's a sub-module of current package
+	// Also handles scoped fork sub-paths: e.g. `@scope/three` source importing `three/tsl`
+	{
+		subPath, ok := strings.CutPrefix(specifier, ctx.pkgJson.Name+"/")
+		if !ok {
+			subPath, ok = strings.CutPrefix(specifier, ctx.pkgJson.PkgName+"/")
+		}
+		if !ok && strings.HasPrefix(ctx.pkgJson.Name, "@") {
+			_, baseName := utils.SplitByFirstByte(ctx.pkgJson.Name[1:], '/')
+			specPkgName := toPackageName(specifier)
+			if specPkgName == baseName {
+				_, inDeps := ctx.pkgJson.Dependencies[specPkgName]
+				_, inPeerDeps := ctx.pkgJson.PeerDependencies[specPkgName]
+				if !inDeps && !inPeerDeps {
+					subPath, ok = strings.CutPrefix(specifier, baseName+"/")
+				}
+			}
+		}
+		if ok {
+			subModule := EsmPath{
+				GhPrefix:   ctx.esmPath.GhPrefix,
+				PrPrefix:   ctx.esmPath.PrPrefix,
+				PkgName:    ctx.esmPath.PkgName,
+				PkgVersion: ctx.esmPath.PkgVersion,
+				SubPath:    stripEntryModuleExt(subPath),
+			}
+			if ctx.pkgJson.SideEffectsFalse {
+				sideEffects = esbuild.SideEffectsFalse
+			} else if ctx.pkgJson.SideEffects.Len() > 0 {
+				entry := ctx.resolveEntry(subModule)
+				if entry.main != "" && !ctx.pkgJson.SideEffects.Has(entry.main) && !ctx.pkgJson.SideEffects.Has(strings.TrimPrefix(entry.main, "./")) {
+					sideEffects = esbuild.SideEffectsFalse
+				}
+			}
+			if withTypeJSON {
+				resolvedPath = "/" + subModule.String()
+				if !strings.HasSuffix(subPath, ".json") {
+					entry := ctx.resolveEntry(subModule)
+					if entry.main != "" {
+						resolvedPath = "/" + subModule.PackageId() + entry.main[1:]
+					}
+				}
+				// esbuild removes the `{ type: "json" }` when it's a dynamic import
+				resolvedPath += "?module"
+			} else {
+				resolvedPath = ctx.getImportPath(subModule, ctx.getBuildArgsPrefix(false), ctx.externalAll)
+				if ctx.bundleMode == BundleFalse {
+					n, e := utils.SplitByLastByte(resolvedPath, '.')
+					resolvedPath = n + ".nobundle." + e
+				}
+			}
+			return
 		}
 	}
 
+	var pkgName string
+	var pkgVersion string
+	var subPath string
+
+	// jsr dependency
+	if strings.HasPrefix(specifier, "jsr:") {
+		pkgName, pkgVersion, subPath = splitEsmPath(specifier[4:])
+		if !strings.HasPrefix(pkgName, "@") || !strings.ContainsRune(pkgName, '/') {
+			err = errors.New("invalid `jsr:` dependency:" + specifier)
+			return
+		}
+		scope, name := utils.SplitByFirstByte(pkgName, '/')
+		pkgName = "@jsr/" + scope[1:] + "__" + name
+	} else {
+		pkgName, pkgVersion, subPath = splitEsmPath(specifier)
+	}
+
+	if pkgVersion == "" {
+		if pkgName == ctx.esmPath.PkgName {
+			pkgVersion = ctx.esmPath.PkgVersion
+		} else if pkgVerson, ok := ctx.args.Deps[pkgName]; ok {
+			pkgVersion = pkgVerson
+		} else if v, ok := ctx.pkgJson.Dependencies[pkgName]; ok {
+			pkgVersion = strings.TrimSpace(v)
+		} else if v, ok := ctx.pkgJson.PeerDependencies[pkgName]; ok {
+			pkgVersion = strings.TrimSpace(v)
+		} else {
+			pkgVersion = "latest"
+		}
+	}
+
+	dep := EsmPath{
+		PkgName:    pkgName,
+		PkgVersion: pkgVersion,
+		SubPath:    stripEntryModuleExt(subPath),
+	}
+
+	// resolve alias in dependencies
+	// e.g. "@mark/html": "npm:@jsr/mark__html@^1.0.0"
+	// e.g. "tslib": "git+https://github.com/microsoft/tslib.git#v2.3.0"
+	// e.g. "react": "github:facebook/react#v18.2.0"
+	p, err := npm.ResolveDependencyVersion(pkgVersion)
+	if err != nil {
+		resolvedPath = fmt.Sprintf("/error.js?type=%s&name=%s&importer=%s", strings.ReplaceAll(err.Error(), " ", "-"), pkgName, ctx.esmPath.String())
+		return
+	}
+	if p.Url != "" {
+		resolvedPath = p.Url
+		return
+	}
+	if p.Name != "" {
+		dep.GhPrefix = p.Github
+		dep.PrPrefix = p.PkgPrNew
+		dep.PkgName = p.Name
+		dep.PkgVersion = p.Version
+	}
+
+	// fetch the latest tag as the version of the repository
+	if dep.GhPrefix && dep.PkgVersion == "" {
+		var refs []GitRef
+		refs, err = listGhRepoRefsContext(ctx.Context(), fmt.Sprintf("https://github.com/%s", dep.PkgName))
+		if err != nil {
+			return
+		}
+		for _, ref := range refs {
+			if ref.Ref == "HEAD" {
+				dep.PkgVersion = ref.Sha[:16]
+				break
+			}
+		}
+	}
+
+	// [workaround] force the dependency version of `react` equals to react-dom
+	if ctx.esmPath.PkgName == "react-dom" && dep.PkgName == "react" {
+		dep.PkgVersion = ctx.esmPath.PkgVersion
+	}
+
+	if withTypeJSON {
+		resolvedPath = "/" + dep.String()
+		if subPath == "" || !strings.HasSuffix(subPath, ".json") {
+			b := &BuildContext{
+				npmrc:   ctx.npmrc,
+				logger:  ctx.logger,
+				esmPath: dep,
+				ctx:     ctx.ctx,
+			}
+			err = b.install()
+			if err != nil {
+				return
+			}
+			entry := b.resolveEntry(dep)
+			if entry.main != "" {
+				resolvedPath = "/" + dep.PackageId() + entry.main[1:]
+			}
+		}
+		if kind == esbuild.ResolveJSDynamicImport {
+			// esbuild removes the `{ type: "json" }` when it's a dynamic import
+			resolvedPath += "?module"
+		}
+		return
+	}
+
+	args := BuildArgs{
+		Alias:      ctx.args.Alias,
+		Deps:       ctx.args.Deps,
+		External:   ctx.args.External,
+		Conditions: ctx.args.Conditions,
+	}
+	err = resolveBuildArgs(ctx.npmrc, ctx.wd, &args, dep)
+	if err != nil {
+		return
+	}
+
+	var exactVersion bool
+	if dep.GhPrefix {
+		exactVersion = isCommitish(dep.PkgVersion) || npm.IsExactVersion(strings.TrimPrefix(dep.PkgVersion, "v"))
+	} else if dep.PrPrefix {
+		exactVersion = true
+	} else {
+		exactVersion = npm.IsExactVersion(dep.PkgVersion)
+	}
+	if exactVersion {
+		buildArgsPrefix := ""
+		if a := encodeBuildArgs(args, false); a != "" {
+			buildArgsPrefix = "X-" + a + "/"
+		}
+		resolvedPath = ctx.getImportPath(dep, buildArgsPrefix, false)
+		return
+	}
+
+	resolvedPath = "/" + dep.String()
+	// workaround for es5-ext "../#/.." path
+	if dep.PkgName == "es5-ext" {
+		resolvedPath = strings.ReplaceAll(resolvedPath, "/#/", "/%23/")
+	}
+	params := []string{}
+	if len(args.Alias) > 0 {
+		var alias []string
+		for k, v := range args.Alias {
+			alias = append(alias, fmt.Sprintf("%s:%s", k, v))
+		}
+		params = append(params, "alias="+strings.Join(alias, ","))
+	}
+	if len(args.Deps) > 0 {
+		var deps sort.StringSlice
+		for n, v := range args.Deps {
+			deps = append(deps, n+"@"+v)
+		}
+		deps.Sort()
+		params = append(params, "deps="+strings.Join(deps, ","))
+	}
+	if args.External.Len() > 0 {
+		external := make(sort.StringSlice, args.External.Len())
+		for i, e := range args.External.Values() {
+			external[i] = e
+		}
+		external.Sort()
+		params = append(params, "external="+strings.Join(external, ","))
+	}
+	if len(args.Conditions) > 0 {
+		conditions := make(sort.StringSlice, len(args.Conditions))
+		copy(conditions, args.Conditions)
+		conditions.Sort()
+		params = append(params, "conditions="+strings.Join(conditions, ","))
+	}
+	if dep.SubPath != "" && strings.HasSuffix(dep.SubPath, ".json") {
+		params = append(params, "module")
+	} else {
+		params = append(params, "target="+ctx.target)
+	}
 	if ctx.dev {
-		name += ".development"
+		params = append(params, "dev")
 	}
-	if ctx.bundleMode == BundleAll {
-		name += ".bundle"
-	} else if ctx.bundleMode == BundleFalse {
-		name += ".nobundle"
-	}
-	ctx.path = fmt.Sprintf(
-		"/%s/%s%s/%s%s",
-		pkg.Fullname(),
-		ctx.getBuildArgsPrefix(ctx.pkg, ctx.target == "types"),
-		ctx.target,
-		name,
-		extname,
-	)
-	return ctx.path
+	resolvedPath += "?" + strings.Join(params, "&")
+	return
 }
 
-func (ctx *BuildContext) getImportPath(pkg Pkg, buildArgsPrefix string) string {
-	name := strings.TrimSuffix(path.Base(pkg.Name), ".js")
-	extname := ".mjs"
-	if pkg.SubModule != "" {
-		name = pkg.SubModule
-		extname = ".js"
-		// workaround for es5-ext weird "/#/" path
-		if pkg.Name == "es5-ext" {
+func (ctx *BuildContext) resolveDTS(entry BuildEntry) (string, error) {
+	if entry.types != "" {
+		return fmt.Sprintf(
+			"/%s/%s%s",
+			ctx.esmPath.PackageId(),
+			ctx.getBuildArgsPrefix(true),
+			strings.TrimPrefix(entry.types, "./"),
+		), nil
+	}
+
+	if ctx.esmPath.SubPath != "" && ctx.pkgJson.Types != "" {
+		return "", nil
+	}
+
+	// lookup types in @types scope
+	if pkgJson := ctx.pkgJson; pkgJson.Types == "" && !strings.HasPrefix(pkgJson.Name, "@types/") && npm.IsExactVersion(pkgJson.Version) {
+		versionParts := strings.Split(pkgJson.Version, ".")
+		versions := []string{
+			versionParts[0] + "." + versionParts[1], // major.minor
+			versionParts[0],                         // major
+		}
+		typesPkgName := npm.ToTypesPackageName(pkgJson.Name)
+		pkgVersion, ok := ctx.args.Deps[typesPkgName]
+		if ok {
+			// use the version of the `?deps` query if it exists
+			versions = append([]string{pkgVersion}, versions...)
+		}
+		for _, version := range versions {
+			p, err := ctx.npmrc.getPackageInfoContext(ctx.Context(), typesPkgName, version)
+			if err == nil {
+				dtsModule := EsmPath{
+					PkgName:    typesPkgName,
+					PkgVersion: p.Version,
+					SubPath:    ctx.esmPath.SubPath,
+				}
+				b := &BuildContext{
+					npmrc:       ctx.npmrc,
+					logger:      ctx.logger,
+					esmPath:     dtsModule,
+					args:        ctx.args,
+					externalAll: ctx.externalAll,
+					target:      "types",
+					ctx:         ctx.ctx,
+				}
+				err := b.install()
+				if err != nil {
+					if strings.Contains(err.Error(), " not found") {
+						return "", nil
+					}
+					return "", err
+				}
+				dts, err := b.resolveDTS(b.resolveEntry(dtsModule))
+				if err != nil {
+					return "", err
+				}
+				if dts != "" {
+					// use tilde semver range instead of the exact version
+					return strings.ReplaceAll(dts, fmt.Sprintf("%s@%s", typesPkgName, p.Version), fmt.Sprintf("%s@~%s", typesPkgName, p.Version)), nil
+				}
+			}
+		}
+	}
+
+	return "", nil
+}
+
+func (ctx *BuildContext) getImportPath(esm EsmPath, buildArgsPrefix string, externalAll bool) string {
+	if strings.HasSuffix(esm.SubPath, ".json") && ctx.existsPkgFile(esm.SubPath) {
+		return "/" + esm.PackageId() + "/" + esm.SubPath + "?module"
+	}
+	asteriskPrefix := ""
+	if externalAll {
+		asteriskPrefix = "*"
+	}
+	name := strings.TrimSuffix(path.Base(esm.PkgName), ".js")
+	if subPath := esm.SubPath; subPath != "" {
+		if subPath == name {
+			// if the sub-module name is same as the package name
+			name = "__" + subPath
+		} else {
+			name = subPath
+		}
+		// workaround for es5-ext "../#/.." path
+		if esm.PkgName == "es5-ext" {
 			name = strings.ReplaceAll(name, "/#/", "/%23/")
 		}
 	}
@@ -143,21 +1115,21 @@ func (ctx *BuildContext) getImportPath(pkg Pkg, buildArgsPrefix string) string {
 		name += ".development"
 	}
 	return fmt.Sprintf(
-		"/%s/%s%s/%s%s",
-		pkg.Fullname(),
+		"/%s%s/%s%s/%s.mjs",
+		asteriskPrefix,
+		esm.PackageId(),
 		buildArgsPrefix,
 		ctx.target,
 		name,
-		extname,
 	)
 }
 
-func (ctx *BuildContext) getSavepath() string {
-	return normalizeSavePath(ctx.zoneId, path.Join("builds", ctx.Path()))
+func (ctx *BuildContext) getSavePath() string {
+	return normalizeSavePath(path.Join("modules", ctx.Path()))
 }
 
-func (ctx *BuildContext) getBuildArgsPrefix(pkg Pkg, isDts bool) string {
-	if a := encodeBuildArgs(ctx.args, pkg, isDts); a != "" {
+func (ctx *BuildContext) getBuildArgsPrefix(isDts bool) string {
+	if a := encodeBuildArgs(ctx.args, isDts); a != "" {
 		return "X-" + a + "/"
 	}
 	return ""
@@ -178,1042 +1150,302 @@ func (ctx *BuildContext) isBrowserTarget() bool {
 	return strings.HasPrefix(ctx.target, "es")
 }
 
+func (ctx *BuildContext) getPkgFullPath(subPath string) string {
+	return path.Join(ctx.wd, "node_modules", ctx.esmPath.PkgName, subPath)
+}
+
 func (ctx *BuildContext) existsPkgFile(fp ...string) bool {
-	args := make([]string, 1+len(fp))
-	args[0] = ctx.pkgDir
-	copy(args[1:], fp)
+	args := make([]string, 3+len(fp))
+	args[0] = ctx.wd
+	args[1] = "node_modules"
+	args[2] = ctx.esmPath.PkgName
+	copy(args[3:], fp)
 	return existsFile(path.Join(args...))
 }
 
-func (ctx *BuildContext) lookupDep(specifier string) (pkg Pkg, p PackageJSON, installed bool, err error) {
-	pkgName, version, subpath, _ := splitPkgPath(specifier)
-	if depVersion, ok := ctx.args.deps[pkgName]; ok {
-		p, err = ctx.npmrc.getPackageInfo(pkgName, depVersion)
-		if err == nil {
-			pkg = Pkg{
-				Name:      pkgName,
-				Version:   p.Version,
-				SubPath:   subpath,
-				SubModule: toModuleBareName(subpath, true),
+func (ctx *BuildContext) resloveSubModule(subPath string) (string, bool) {
+	if subPath != "" {
+		if ctx.existsPkgFile(subPath) {
+			return subPath, true
+		}
+		preferExt := ".mjs"
+		if ctx.pkgJson.Type == "commonjs" {
+			preferExt = ".cjs"
+		}
+		for _, ext := range []string{preferExt, "js", "mts", "ts", "cts"} {
+			if ctx.existsPkgFile(subPath + "." + ext) {
+				return subPath + "." + ext, true
 			}
-		}
-		return
-	}
-	pkgJsonPath := path.Join(ctx.wd, "node_modules", ".pnpm", "node_modules", pkgName, "package.json")
-	if !existsFile(pkgJsonPath) {
-		pkgJsonPath = path.Join(ctx.wd, "node_modules", pkgName, "package.json")
-	}
-	if existsFile(pkgJsonPath) && parseJSONFile(pkgJsonPath, &p) == nil {
-		pkg = Pkg{
-			Name:      pkgName,
-			Version:   p.Version,
-			SubPath:   subpath,
-			SubModule: toModuleBareName(subpath, true),
-		}
-		installed = true
-		return
-	}
-	if version == "" {
-		if v, ok := ctx.pkgJson.Dependencies[pkgName]; ok {
-			if strings.HasPrefix(v, "npm:") {
-				pkgName, version, _, _ = splitPkgPath(v[4:])
-			} else {
-				version = v
+			if ctx.existsPkgFile(subPath + "/index." + ext) {
+				return subPath + "/index." + ext, true
 			}
-		} else if v, ok = ctx.pkgJson.PeerDependencies[pkgName]; ok {
-			version = v
-		} else {
-			version = "latest"
-		}
-	}
-	p, err = ctx.npmrc.getPackageInfo(pkgName, version)
-	if err == nil {
-		pkg = Pkg{
-			Name:      pkgName,
-			Version:   p.Version,
-			SubPath:   subpath,
-			SubModule: toModuleBareName(subpath, true),
-		}
-	}
-	return
-}
-
-func (ctx *BuildContext) resolveEntry(pkg Pkg) (entry BuildEntry) {
-	pkgDir := ctx.pkgDir
-
-	if pkg.SubModule != "" {
-		subModule := pkg.SubModule
-
-		if endsWith(pkg.SubPath, ".d.ts", ".d.mts") {
-			entry.dts = "./" + pkg.SubPath
-			return
-		}
-		if endsWith(pkg.SubPath, ".jsx", ".ts", ".tsx") {
-			entry.esm = "./" + pkg.SubPath
-			return
-		}
-
-		// reslove sub-module using `exports` conditions if exists
-		// see https://nodejs.org/api/packages.html#package-entry-points
-		if ctx.pkgJson.Exports != nil {
-			exportEntry := BuildEntry{}
-			if om, ok := ctx.pkgJson.Exports.(*OrderedMap); ok {
-				for _, name := range om.keys {
-					conditions := om.Get(name)
-					if name == "./"+subModule || stripModuleExt(name, ".js", ".cjs", ".mjs") == "./"+subModule {
-						if s, ok := conditions.(string); ok {
-							/**
-							exports: {
-								"./lib/foo": "./lib/foo.js"
-							}
-							*/
-							if ctx.pkgJson.Type == "module" {
-								exportEntry.esm = s
-							} else {
-								exportEntry.cjs = s
-							}
-						} else if om, ok := conditions.(*OrderedMap); ok {
-							/**
-							exports: {
-								"./lib/foo": {
-									"require": "./lib/foo.js",
-									"import": "./esm/foo.js",
-									"types": "./types/foo.d.ts"
-								}
-							}
-							*/
-							exportEntry = ctx.resolveConditionExportEntry(om, ctx.pkgJson.Type)
-						}
-						break
-					} else if diff, ok := matchAsteriskExports(name, pkg); ok {
-						if s, ok := conditions.(string); ok {
-							/**
-							exports: {
-								"./lib/foo/*": "./lib/foo/*.js",
-							}
-							*/
-							e := strings.ReplaceAll(s, "*", diff)
-							if ctx.pkgJson.Type == "module" {
-								exportEntry.esm = e
-							} else {
-								exportEntry.cjs = e
-							}
-						} else if om, ok := conditions.(*OrderedMap); ok {
-							/**
-							exports: {
-								"./lib/foo/*": {
-									"require": "./lib/foo/*.js",
-									"import": "./esm/lib/foo/*.js",
-									"types": "./types/foo/*.d.ts"
-								},
-							}
-							*/
-							exportEntry = ctx.resolveConditionExportEntry(resloveAsteriskPathMapping(om, diff), ctx.pkgJson.Type)
-						}
-					}
-				}
-			}
-			normalizeBuildEntry(ctx, &exportEntry)
-			if exportEntry.esm != "" && ctx.existsPkgFile(exportEntry.esm) {
-				entry.esm = exportEntry.esm
-			}
-			if exportEntry.cjs != "" && ctx.existsPkgFile(exportEntry.cjs) {
-				entry.cjs = exportEntry.cjs
-			}
-			if exportEntry.dts != "" && ctx.existsPkgFile(exportEntry.dts) {
-				entry.dts = exportEntry.dts
-			}
-		}
-
-		var p PackageJSON
-		if parseJSONFile(path.Join(pkgDir, subModule, "package.json"), &p) == nil {
-			if entry.esm == "" && p.Module != "" {
-				entry.esm = "./" + path.Join(subModule, p.Module)
-			}
-			if entry.cjs == "" && p.Main != "" {
-				entry.cjs = "./" + path.Join(subModule, p.Main)
-			}
-			if entry.dts == "" {
-				if p.Types != "" {
-					entry.dts = "./" + path.Join(subModule, p.Types)
-				} else if p.Typings != "" {
-					entry.dts = "./" + path.Join(subModule, p.Typings)
-				}
-			}
-		}
-
-		if entry.esm == "" {
-			if ctx.existsPkgFile(subModule + ".mjs") {
-				entry.esm = "./" + subModule + ".mjs"
-			} else if ctx.existsPkgFile(subModule, "index.mjs") {
-				entry.esm = "./" + subModule + "/index.mjs"
-			} else if ctx.pkgJson.Type == "module" {
-				if ctx.existsPkgFile(subModule + ".js") {
-					entry.esm = "./" + subModule + ".js"
-				} else if ctx.existsPkgFile(subModule, "index.js") {
-					entry.esm = "./" + subModule + "/index.js"
-				}
-			}
-		}
-
-		if entry.cjs == "" {
-			if ctx.existsPkgFile(subModule + ".cjs") {
-				entry.cjs = "./" + subModule + ".cjs"
-			} else if ctx.existsPkgFile(subModule, "index.cjs") {
-				entry.cjs = "./" + subModule + "/index.cjs"
-			} else if ctx.pkgJson.Type != "module" {
-				if ctx.existsPkgFile(subModule + ".js") {
-					entry.cjs = "./" + subModule + ".js"
-				} else if ctx.existsPkgFile(subModule, "index.js") {
-					entry.cjs = "./" + subModule + "/index.js"
-				}
-			}
-		}
-
-		if entry.dts == "" {
-			if entry.esm != "" && ctx.existsPkgFile(stripModuleExt(entry.esm)+".d.ts") {
-				entry.dts = stripModuleExt(entry.esm) + ".d.ts"
-			} else if entry.cjs != "" && ctx.existsPkgFile(stripModuleExt(entry.cjs)+".d.ts") {
-				entry.dts = stripModuleExt(entry.cjs) + ".d.ts"
-			} else if ctx.existsPkgFile(subModule + ".d.mts") {
-				entry.dts = "./" + subModule + ".d.mts"
-			} else if ctx.existsPkgFile(subModule + ".d.ts") {
-				entry.dts = "./" + subModule + ".d.ts"
-			} else if ctx.existsPkgFile(subModule, "index.d.mts") {
-				entry.dts = "./" + subModule + "/index.d.mts"
-			} else if ctx.existsPkgFile(subModule, "index.d.ts") {
-				entry.dts = "./" + subModule + "/index.d.ts"
-			}
-		}
-	} else {
-		entry = BuildEntry{
-			esm: ctx.pkgJson.Module,
-			cjs: ctx.pkgJson.Main,
-			dts: ctx.pkgJson.Types,
-		}
-		if entry.dts == "" && ctx.pkgJson.Typings != "" {
-			entry.dts = ctx.pkgJson.Typings
-		}
-
-		if exports := ctx.pkgJson.Exports; exports != nil {
-			exportEntry := BuildEntry{}
-			if om, ok := exports.(*OrderedMap); ok {
-				v, ok := om.m["."]
-				if ok {
-					if s, ok := v.(string); ok {
-						/**
-						exports: {
-							".": "./index.js"
-						}
-						*/
-						if ctx.pkgJson.Type == "module" {
-							exportEntry.esm = s
-						} else {
-							exportEntry.cjs = s
-						}
-					} else if om, ok := v.(*OrderedMap); ok {
-						/**
-						exports: {
-							".": {
-								"require": "./cjs/index.js",
-								"import": "./esm/index.js"
-							}
-						}
-						*/
-						exportEntry = ctx.resolveConditionExportEntry(om, ctx.pkgJson.Type)
-					}
-				} else {
-					/**
-					exports: {
-						"require": "./cjs/index.js",
-						"import": "./esm/index.js"
-					}
-					*/
-					exportEntry = ctx.resolveConditionExportEntry(om, ctx.pkgJson.Type)
-				}
-			} else if s, ok := exports.(string); ok {
-				/**
-				exports: "./index.js"
-				*/
-				if ctx.pkgJson.Type == "module" {
-					exportEntry.esm = s
-				} else {
-					exportEntry.cjs = s
-				}
-			}
-			normalizeBuildEntry(ctx, &exportEntry)
-			if exportEntry.esm != "" && ctx.existsPkgFile(exportEntry.esm) {
-				entry.esm = exportEntry.esm
-			}
-			if exportEntry.cjs != "" && ctx.existsPkgFile(exportEntry.cjs) {
-				entry.cjs = exportEntry.cjs
-			}
-			if exportEntry.dts != "" && ctx.existsPkgFile(exportEntry.dts) {
-				entry.dts = exportEntry.dts
-			}
-		}
-
-		if entry.esm == "" {
-			if ctx.pkgJson.Type == "module" && ctx.existsPkgFile("index.js") {
-				entry.esm = "./index.js"
-			} else if ctx.existsPkgFile("index.mjs") {
-				entry.esm = "./index.mjs"
-			}
-		}
-
-		if entry.cjs == "" {
-			if ctx.pkgJson.Type != "module" && ctx.existsPkgFile("index.js") {
-				entry.cjs = "./index.js"
-			} else if ctx.existsPkgFile("index.cjs") {
-				entry.cjs = "./index.cjs"
-			}
-		}
-
-		if entry.dts == "" {
-			if ctx.existsPkgFile("index.d.mts") {
-				entry.dts = "./index.d.mts"
-			} else if ctx.existsPkgFile("index.d.ts") {
-				entry.dts = "./index.d.ts"
-			}
-		}
-		if entry.dts == "" && entry.esm != "" {
-			if ctx.existsPkgFile(stripModuleExt(entry.esm) + ".d.mts") {
-				entry.dts = stripModuleExt(entry.esm) + ".d.mts"
-			} else if ctx.existsPkgFile(stripModuleExt(entry.esm) + ".d.ts") {
-				entry.dts = stripModuleExt(entry.esm) + ".d.ts"
-			} else if stripModuleExt(path.Base(entry.esm)) == "index" {
-				dir, _ := utils.SplitByLastByte(entry.esm, '/')
-				if ctx.existsPkgFile(dir, "index.d.mts") {
-					entry.dts = dir + "/index.d.mts"
-				} else if ctx.existsPkgFile(dir, "index.d.ts") {
-					entry.dts = dir + "/index.d.ts"
-				}
-			}
-		}
-		if entry.dts == "" && entry.cjs != "" {
-			if ctx.existsPkgFile(stripModuleExt(entry.cjs) + ".d.mts") {
-				entry.dts = stripModuleExt(entry.cjs) + ".d.mts"
-			} else if ctx.existsPkgFile(stripModuleExt(entry.cjs) + ".d.ts") {
-				entry.dts = stripModuleExt(entry.cjs) + ".d.ts"
-			} else if stripModuleExt(path.Base(entry.cjs)) == "index" {
-				dir, _ := utils.SplitByLastByte(entry.cjs, '/')
-				if ctx.existsPkgFile(dir, "index.d.mts") {
-					entry.dts = dir + "/index.d.mts"
-				} else if ctx.existsPkgFile(dir, "index.d.ts") {
-					entry.dts = dir + "/index.d.ts"
-				}
-			}
-		}
-	}
-
-	// resovle dts from `typesVersions` field if it's defined
-	// see https://www.typescriptlang.org/docs/handbook/declaration-files/publishing.html#version-selection-with-typesversions
-	if typesVersions := ctx.pkgJson.TypesVersions; len(typesVersions) > 0 && entry.dts != "" {
-		versions := make(sort.StringSlice, len(typesVersions))
-		i := 0
-		for c := range typesVersions {
-			if strings.HasPrefix(c, ">") {
-				versions[i] = c
-				i++
-			}
-		}
-		versions = versions[:i]
-		if versions.Len() > 0 {
-			versions.Sort()
-			latestVersion := ctx.pkgJson.TypesVersions[versions[versions.Len()-1]]
-			if mapping, ok := latestVersion.(map[string]interface{}); ok {
-				var paths interface{}
-				var matched bool
-				var exact bool
-				var suffix string
-				dts := normalizeEntryPath(entry.dts)
-				paths, matched = mapping[dts]
-				if !matched {
-					// try to match the dts wihout leading "./"
-					paths, matched = mapping[strings.TrimPrefix(dts, "./")]
-				}
-				if matched {
-					exact = true
-				}
-				if !matched {
-					for key, value := range mapping {
-						if strings.HasSuffix(key, "/*") {
-							key = normalizeEntryPath(key)
-							if strings.HasPrefix(dts, strings.TrimSuffix(key, "/*")) {
-								paths = value
-								matched = true
-								suffix = strings.TrimPrefix(dts, strings.TrimSuffix(key, "*"))
-								break
-							}
-						}
-					}
-				}
-				if !matched {
-					paths, matched = mapping["*"]
-				}
-				if matched {
-					if a, ok := paths.([]interface{}); ok && len(a) > 0 {
-						if path, ok := a[0].(string); ok {
-							path = normalizeEntryPath(path)
-							if exact {
-								entry.dts = path
-							} else {
-								prefix, _ := utils.SplitByLastByte(path, '*')
-								if suffix != "" {
-									entry.dts = prefix + suffix
-								} else if strings.HasPrefix(dts, prefix) {
-									diff := strings.TrimPrefix(dts, prefix)
-									entry.dts = strings.ReplaceAll(path, "*", diff)
-								} else {
-									entry.dts = prefix + dts[2:]
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// check the `browser` field
-	if len(ctx.pkgJson.Browser) > 0 && ctx.isBrowserTarget() {
-		// normalize the entry
-		normalizeBuildEntry(ctx, &entry)
-		if entry.esm != "" {
-			m, ok := ctx.pkgJson.Browser[entry.esm]
-			if ok && isRelativeSpecifier(m) {
-				entry.esm = m
-			}
-		}
-		if entry.cjs != "" {
-			m, ok := ctx.pkgJson.Browser[entry.cjs]
-			if ok && isRelativeSpecifier(m) {
-				entry.cjs = m
-			}
-		}
-		if pkg.SubModule == "" {
-			if m, ok := ctx.pkgJson.Browser["."]; ok && isRelativeSpecifier(m) {
-				if ctx.pkgJson.Type == "module" || strings.HasSuffix(m, ".mjs") {
-					entry.esm = m
-				} else {
-					entry.cjs = m
-				}
-			}
-		}
-	}
-
-	// normalize the entry
-	normalizeBuildEntry(ctx, &entry)
-	return
-}
-
-// see https://nodejs.org/api/packages.html#nested-conditions
-func (ctx *BuildContext) resolveConditionExportEntry(conditions *OrderedMap, mType string) (entry BuildEntry) {
-	entryKey := "esm"
-	switch mType {
-	case "module":
-		entryKey = "esm"
-	case "", "commonjs":
-		entryKey = "cjs"
-	case "types":
-		entryKey = "dts"
-	}
-
-	if len(ctx.args.conditions) > 0 {
-		for _, conditionName := range ctx.args.conditions {
-			condition := conditions.Get(conditionName)
-			if condition != nil {
-				entry.resolve(ctx, mType, condition, entryKey)
-			}
-		}
-	}
-
-	if ctx.dev {
-		condition := conditions.Get("development")
-		if condition != nil {
-			entry.resolve(ctx, mType, condition, entryKey)
-		}
-	}
-
-	if ctx.isBrowserTarget() {
-		condition := conditions.Get("browser")
-		if condition != nil {
-			entry.resolve(ctx, mType, condition, entryKey)
-		}
-	} else if ctx.isDenoTarget() {
-		var condition interface{}
-		for _, conditionName := range []string{"deno", "workerd", "worker", "node"} {
-			condition = conditions.Get(conditionName)
-			if condition != nil {
-				// entry.ibc = conditionName != "browser"
-				entry.resolve(ctx, mType, condition, entryKey)
-				break
-			}
-		}
-	} else if ctx.target == "node" {
-		condition := conditions.Get("node")
-		if condition != nil {
-			entry.resolve(ctx, mType, condition, entryKey)
-		}
-	}
-
-	for _, conditionName := range conditions.keys {
-		condition := conditions.Get(conditionName)
-		switch conditionName {
-		case "module", "import", "es2015":
-			entry.resolve(ctx, "module", condition, "esm")
-		case "require":
-			entry.resolve(ctx, "commonjs", condition, "cjs")
-		case "types", "typings":
-			entry.resolve(ctx, "types", condition, "dts")
-		case "default":
-			entry.resolve(ctx, mType, condition, entryKey)
-		}
-	}
-	return
-}
-
-func (ctx *BuildContext) resolveExternalModule(specifier string, kind api.ResolveKind) (resolvedPath string) {
-	defer func() {
-		fullResolvedPath := resolvedPath
-		// use relative path for sub-module of current package
-		if strings.HasPrefix(specifier, ctx.pkgJson.Name+"/") {
-			rp, err := relPath(path.Dir(ctx.Path()), resolvedPath)
-			if err == nil {
-				resolvedPath = rp
-			}
-		}
-		// mark the resolved path for _preload_
-		if kind != api.ResolveJSDynamicImport {
-			ctx.imports = append(ctx.imports, [2]string{fullResolvedPath, resolvedPath})
-		}
-		// if it's `require("module")` call
-		if kind == api.ResolveJSRequireCall {
-			ctx.requires = append(ctx.requires, [3]string{specifier, fullResolvedPath, resolvedPath})
-			resolvedPath = specifier
-		}
-	}()
-
-	// it's current package from github
-	if npm := ctx.pkgJson; ctx.pkg.FromGithub && (specifier == npm.Name || specifier == npm.PkgName) {
-		pkg := Pkg{
-			Name:       npm.Name,
-			Version:    npm.Version,
-			FromGithub: true,
-		}
-		resolvedPath = ctx.getImportPath(pkg, ctx.getBuildArgsPrefix(pkg, false))
-		return
-	}
-
-	// node builtin module
-	if nodejsInternalModules[specifier] {
-		if ctx.args.external.Has("node:"+specifier) || ctx.args.external.Has("*") {
-			resolvedPath = fmt.Sprintf("node:%s", specifier)
-		} else if ctx.target == "node" {
-			resolvedPath = fmt.Sprintf("node:%s", specifier)
-		} else if ctx.target == "denonext" && !denoNextUnspportedNodeModules[specifier] {
-			resolvedPath = fmt.Sprintf("node:%s", specifier)
-		} else if ctx.target == "deno" {
-			resolvedPath = fmt.Sprintf("https://deno.land/std@0.177.1/node/%s.ts", specifier)
-		} else {
-			resolvedPath = fmt.Sprintf("/node/%s.js", specifier)
-		}
-		return
-	}
-
-	// check `?external`
-	if ctx.args.external.Has("*") || ctx.args.external.Has(getPkgName(specifier)) {
-		resolvedPath = specifier
-		return
-	}
-
-	// it's sub-module of current package
-	if strings.HasPrefix(specifier, ctx.pkgJson.Name+"/") {
-		subPath := strings.TrimPrefix(specifier, ctx.pkgJson.Name+"/")
-		subPkg := Pkg{
-			Name:       ctx.pkg.Name,
-			Version:    ctx.pkg.Version,
-			SubPath:    subPath,
-			SubModule:  toModuleBareName(subPath, false),
-			FromGithub: ctx.pkg.FromGithub,
-		}
-		if ctx.subBuilds != nil {
-			b := &BuildContext{
-				zoneId:        ctx.zoneId,
-				npmrc:         ctx.npmrc,
-				pkg:           subPkg,
-				pkgJson:       ctx.pkgJson,
-				pkgDeprecated: ctx.pkgDeprecated,
-				args:          ctx.args,
-				target:        ctx.target,
-				dev:           ctx.dev,
-				sourceMap:     ctx.sourceMap,
-				wd:            ctx.wd,
-				pkgDir:        ctx.pkgDir,
-				pnpmPkgDir:    ctx.pnpmPkgDir,
-				subBuilds:     ctx.subBuilds,
-			}
-			if ctx.bundleMode == BundleFalse {
-				b.bundleMode = BundleFalse
-			}
-			path := b.Path()
-			if !ctx.subBuilds.Has(path) {
-				ctx.subBuilds.Add(path)
-				ctx.wg.Add(1)
-				go func() {
-					defer ctx.wg.Done()
-					b.Build()
-				}()
-			}
-		}
-		resolvedPath = ctx.getImportPath(subPkg, ctx.getBuildArgsPrefix(subPkg, false))
-		if ctx.bundleMode == BundleFalse {
-			n, e := utils.SplitByLastByte(resolvedPath, '.')
-			resolvedPath = n + ".nobundle." + e
-		}
-		return
-	}
-
-	// replace some npm polyfills with native APIs
-	if data, ok := npmPolyfills[specifier]; ok {
-		resolvedPath = fmt.Sprintf("data:text/javascript;base64,%s", base64.StdEncoding.EncodeToString(data))
-		return
-	}
-	if specifier == "node-fetch" && ctx.target != "node" {
-		resolvedPath = "/npm_node-fetch.js"
-		return
-	}
-
-	// common npm dependency
-	pkgName, version, subpath, _ := splitPkgPath(specifier)
-	if version == "" {
-		if pkgName == ctx.pkg.Name {
-			version = ctx.pkg.Version
-		} else if pkgVerson, ok := ctx.args.deps[pkgName]; ok {
-			version = pkgVerson
-		} else if v, ok := ctx.pkgJson.Dependencies[pkgName]; ok {
-			version = v
-		} else if v, ok := ctx.pkgJson.PeerDependencies[pkgName]; ok {
-			version = v
-		} else {
-			version = "latest"
-		}
-	}
-	// force the version of 'react' (as dependency) equals to 'react-dom'
-	if ctx.pkg.Name == "react-dom" && pkgName == "react" {
-		version = ctx.pkg.Version
-	}
-
-	pkg := Pkg{
-		Name:      pkgName,
-		Version:   version,
-		SubPath:   subpath,
-		SubModule: toModuleBareName(subpath, true),
-	}
-	isCaretVersion := strings.HasPrefix(version, "^")
-
-	// resolve alias in dependencies
-	// follow https://docs.npmjs.com/cli/v10/configuring-npm/package-json#git-urls-as-dependencies
-	// e.g. "@mark/html": "npm:@jsr/mark__html@^1.0.0"
-	// e.g. "tslib": "git+https://github.com/microsoft/tslib.git#v2.3.0"
-	// e.g. "react": "github:facebook/react#v18.2.0"
-	{
-		// ban file specifier
-		if strings.HasPrefix(version, "file:") {
-			resolvedPath = fmt.Sprintf("/error.js?type=unsupported-file-dependency&name=%s&importer=%s", pkgName, ctx.pkg)
-			return
-		}
-		if strings.HasPrefix(version, "npm:") {
-			pkg.Name, pkg.Version, _, _ = splitPkgPath(version[4:])
-		} else if strings.HasPrefix(version, "git+ssh://") || strings.HasPrefix(version, "git+https://") || strings.HasPrefix(version, "git://") {
-			gitUrl, err := url.Parse(version)
-			if err != nil || gitUrl.Hostname() != "github.com" {
-				resolvedPath = fmt.Sprintf("/error.js?type=unsupported-git-dependency&name=%s&importer=%s", pkgName, ctx.pkg)
-				return
-			}
-			repo := strings.TrimSuffix(gitUrl.Path[1:], ".git")
-			if gitUrl.Scheme == "git+ssh" {
-				repo = gitUrl.Port() + "/" + repo
-			}
-			pkg.FromGithub = true
-			pkg.Name = repo
-			pkg.Version = strings.TrimPrefix(url.QueryEscape(gitUrl.Fragment), "semver:")
-		} else if strings.HasPrefix(version, "github:") || (!strings.HasPrefix(version, "@") && strings.ContainsRune(version, '/')) {
-			repo, fragment := utils.SplitByLastByte(strings.TrimPrefix(version, "github:"), '#')
-			pkg.FromGithub = true
-			pkg.Name = repo
-			pkg.Version = strings.TrimPrefix(url.QueryEscape(fragment), "semver:")
-		}
-	}
-
-	if pkg.FromGithub {
-		// fetch the latest tag as the version of the repository
-		if pkg.Version == "" {
-			refs, err := listRepoRefs(fmt.Sprintf("https://github.com/%s", pkg.Name))
-			if err == nil {
-				for _, ref := range refs {
-					if ref.Ref == "HEAD" {
-						pkg.Version = ref.Sha[:16]
-						break
-					}
-				}
-			}
-		}
-	} else if !isCaretVersion && !regexpFullVersion.MatchString(version) {
-		// fetch the latest version of the package based on the semver range
-		_, p, _, err := ctx.lookupDep(pkgName + "@" + version)
-		if err == nil {
-			pkg.Version = p.Version
-		}
-	}
-
-	args := BuildArgs{
-		alias:      ctx.args.alias,
-		conditions: ctx.args.conditions,
-		deps:       ctx.args.deps,
-		external:   ctx.args.external,
-		exports:    NewStringSet(),
-	}
-	fixBuildArgs(ctx.npmrc, &args, pkg)
-	if isCaretVersion {
-		resolvedPath = "/" + pkg.String()
-		// workaround for es5-ext weird "/#/" path
-		if pkg.Name == "es5-ext" {
-			resolvedPath = strings.ReplaceAll(resolvedPath, "/#/", "/%23/")
-		}
-		params := []string{"target=" + ctx.target}
-		if len(args.alias) > 0 {
-			var alias []string
-			for k, v := range args.alias {
-				alias = append(alias, fmt.Sprintf("%s:%s", k, v))
-			}
-			params = append(params, "alias="+strings.Join(alias, ","))
-		}
-		if len(args.deps) > 0 {
-			var deps sort.StringSlice
-			for n, v := range args.deps {
-				deps = append(deps, n+"@"+v)
-			}
-			deps.Sort()
-			params = append(params, "deps="+strings.Join(deps, ","))
-		}
-		if args.external.Len() > 0 {
-			external := make(sort.StringSlice, args.external.Len())
-			for i, e := range args.external.Values() {
-				external[i] = e
-			}
-			external.Sort()
-			params = append(params, "external="+strings.Join(external, ","))
-		}
-		if len(args.conditions) > 0 {
-			conditions := make(sort.StringSlice, len(args.conditions))
-			copy(conditions, args.conditions)
-			conditions.Sort()
-			params = append(params, "conditions="+strings.Join(conditions, ","))
-		}
-		if ctx.dev {
-			params = append(params, "dev")
-		}
-		params = append(params, "no-dts")
-		resolvedPath += "?" + strings.Join(params, "&")
-	} else {
-		buildArgsPrefix := ""
-		if a := encodeBuildArgs(args, pkg, false); a != "" {
-			buildArgsPrefix = "X-" + a + "/"
-		}
-		resolvedPath = ctx.getImportPath(pkg, buildArgsPrefix)
-	}
-	return
-}
-
-func (ctx *BuildContext) resloveDTS(entry BuildEntry) (string, error) {
-	if entry.dts != "" {
-		if !ctx.existsPkgFile(entry.dts) {
-			return "", nil
-		}
-		return fmt.Sprintf(
-			"/%s%s/%s%s",
-			ctx.pkg.ghPrefix(),
-			ctx.pkg.Fullname(),
-			ctx.getBuildArgsPrefix(ctx.pkg, true),
-			strings.TrimPrefix(entry.dts, "./"),
-		), nil
-	}
-
-	// use types from package "@types/[task.npm.Name]" if it exists
-	if ctx.pkgJson.Types == "" && !strings.HasPrefix(ctx.pkgJson.Name, "@types/") && regexpFullVersion.MatchString(ctx.pkgJson.Version) {
-		versionParts := strings.Split(ctx.pkgJson.Version, ".")
-		versions := []string{
-			versionParts[0] + "." + versionParts[1], // major.minor
-			versionParts[0],                         // major
-		}
-		typesPkgName := toTypesPkgName(ctx.pkgJson.Name)
-		pkgVersion, ok := ctx.args.deps[typesPkgName]
-		if ok {
-			// use the version of the `?deps` query if it exists
-			versions = append([]string{pkgVersion}, versions...)
-		}
-		for _, version := range versions {
-			p, err := ctx.npmrc.getPackageInfo(typesPkgName, version)
-			if err == nil {
-				typesPkg := Pkg{
-					Name:      typesPkgName,
-					Version:   p.Version,
-					SubPath:   ctx.pkg.SubPath,
-					SubModule: ctx.pkg.SubModule,
-				}
-				b := NewBuildContext(ctx.zoneId, ctx.npmrc, typesPkg, ctx.args, "types", BundleFalse, false, false)
-				err := b.install()
-				if err != nil {
-					return "", err
-				}
-				dts, err := b.resloveDTS(b.resolveEntry(typesPkg))
-				if err != nil {
-					return "", err
-				}
-				if dts != "" {
-					// use tilde semver range instead of the exact version
-					return strings.ReplaceAll(dts, fmt.Sprintf("%s@%s", typesPkgName, p.Version), fmt.Sprintf("%s@~%s", typesPkgName, p.Version)), nil
-				}
-			}
-		}
-	}
-
-	return "", nil
-}
-
-func (ctx *BuildContext) normalizePackageJSON(p PackageJSON) PackageJSON {
-	if ctx.pkg.FromGithub {
-		// if the name in package.json is not the same as the repository name
-		if p.Name != ctx.pkg.Name {
-			p.PkgName = p.Name
-			p.Name = ctx.pkg.Name
-		}
-		p.Version = ctx.pkg.Version
-	} else {
-		p.Version = strings.TrimPrefix(p.Version, "v")
-	}
-
-	if ctx.target == "types" {
-		return p
-	}
-
-	if p.Module == "" {
-		if p.ES2015 != "" && ctx.existsPkgFile(p.ES2015) {
-			p.Module = p.ES2015
-		} else if p.JsNextMain != "" && ctx.existsPkgFile(p.JsNextMain) {
-			p.Module = p.JsNextMain
-		} else if p.Main != "" && (p.Type == "module" || strings.HasSuffix(p.Main, ".mjs")) {
-			p.Module = p.Main
-			p.Main = ""
-		}
-	}
-
-	// Check if the `SubPath` is the same as the `main` or `module` field of the package.json
-	if subModule := ctx.pkg.SubModule; subModule != "" {
-		isPkgMainModule := false
-		check := func(s string) bool {
-			return isPkgMainModule || (s != "" && subModule == utils.CleanPath(stripModuleExt(s))[1:])
-		}
-		if p.Exports != nil {
-			if s, ok := p.Exports.(string); ok {
-				isPkgMainModule = check(s)
-			} else if om, ok := p.Exports.(*OrderedMap); ok {
-				if v := om.Get("."); v != nil {
-					if s, ok := v.(string); ok {
-						// exports: { ".": "./index.js" }
-						isPkgMainModule = check(s)
-					} else if om, ok := v.(*OrderedMap); ok {
-						// exports: { ".": { "require": "./cjs/index.js", "import": "./esm/index.js" } }
-						// exports: { ".": { "node": { "require": "./cjs/index.js", "import": "./esm/index.js" } } }
-						// ...
-						paths := getAllExportsPaths(om)
-						for _, path := range paths {
-							if check(path) {
-								isPkgMainModule = true
-								break
-							}
-						}
-					}
-				}
-			}
-		}
-		if !isPkgMainModule {
-			isPkgMainModule = (p.Module != "" && check(p.Module)) || (p.Main != "" && check(p.Main))
-		}
-		if isPkgMainModule {
-			ctx.pkg.SubModule = ""
-			ctx.pkg.SubPath = ""
-			ctx.path = ""
-		}
-	}
-
-	return p
-}
-
-func (ctx *BuildContext) lexer(entry *BuildEntry, forceCjsOnly bool) (ret BuildResult, reexport string, err error) {
-	if entry.esm != "" && !forceCjsOnly {
-		isESM, namedExports, erro := ctx.esmLexer(entry.esm)
-		if erro != nil {
-			err = erro
-			return
-		}
-
-		if isESM {
-			ret.NamedExports = namedExports
-			ret.HasDefaultExport = includes(namedExports, "default")
-			return
-		}
-
-		var r cjsLexerResult
-		r, err = ctx.cjsLexer(entry.esm)
-		if err != nil {
-			return
-		}
-
-		ret.HasDefaultExport = r.HasDefaultExport
-		ret.NamedExports = r.NamedExports
-		ret.FromCJS = true
-		entry.cjs = entry.esm
-		entry.esm = ""
-		reexport = r.ReExport
-		log.Warnf("fake ES module '%s' of '%s'", entry.cjs, ctx.pkgJson.Name)
-		return
-	}
-
-	if entry.cjs != "" {
-		var cjs cjsLexerResult
-		cjs, err = ctx.cjsLexer(entry.cjs)
-		if err != nil {
-			return
-		}
-		ret.HasDefaultExport = cjs.HasDefaultExport
-		ret.NamedExports = cjs.NamedExports
-		ret.FromCJS = true
-		reexport = cjs.ReExport
-	}
-	return
-}
-
-func (ctx *BuildContext) cjsLexer(specifier string) (cjs cjsLexerResult, err error) {
-	cjs, err = cjsLexer(ctx.npmrc, ctx.pkg.Name, ctx.wd, specifier, ctx.getNodeEnv())
-	if err == nil && cjs.Error != "" {
-		err = fmt.Errorf("cjsLexer: %s", cjs.Error)
-	}
-	return
-}
-
-func (ctx *BuildContext) esmLexer(specifier string) (isESM bool, namedExports []string, err error) {
-	isESM, namedExports, err = validateJSFile(path.Join(ctx.wd, "node_modules", ctx.pkg.Name, specifier))
-	if err != nil {
-		err = fmt.Errorf("esmLexer: %v", err)
-	}
-	return
-}
-
-func matchAsteriskExports(epxortsKey string, pkg Pkg) (diff string, match bool) {
-	if strings.ContainsRune(epxortsKey, '*') {
-		prefix, _ := utils.SplitByLastByte(epxortsKey, '*')
-		if subModule := "./" + pkg.SubModule; strings.HasPrefix(subModule, prefix) {
-			return strings.TrimPrefix(subModule, prefix), true
 		}
 	}
 	return "", false
 }
 
-func resloveAsteriskPathMapping(om *OrderedMap, diff string) *OrderedMap {
-	resovedConditions := newOrderedMap()
-	for _, key := range om.keys {
-		value := om.Get(key)
-		if s, ok := value.(string); ok {
-			resovedConditions.Set(key, strings.ReplaceAll(s, "*", diff))
-		} else if om, ok := value.(*OrderedMap); ok {
-			resovedConditions.Set(key, resloveAsteriskPathMapping(om, diff))
+func (ctx *BuildContext) resolveDependency(specifier string, isDts bool) (esm EsmPath, packageJson *npm.PackageJSON, err error) {
+	pkgName, version, subPath := splitEsmPath(specifier)
+lookup:
+	if v, ok := ctx.args.Deps[pkgName]; ok {
+		packageJson, err = ctx.npmrc.getPackageInfoContext(ctx.Context(), pkgName, v)
+		if err == nil {
+			esm = EsmPath{
+				PkgName:    pkgName,
+				PkgVersion: packageJson.Version,
+				SubPath:    stripEntryModuleExt(subPath),
+			}
+		}
+		return
+	}
+
+	var raw npm.PackageJSONRaw
+	pkgJsonPath := path.Join(ctx.wd, "node_modules", pkgName, "package.json")
+	if utils.ParseJSONFile(pkgJsonPath, &raw) == nil {
+		esm = EsmPath{
+			PkgName:    pkgName,
+			PkgVersion: raw.Version,
+			SubPath:    stripEntryModuleExt(subPath),
+		}
+		packageJson = raw.ToNpmPackage()
+		return
+	}
+
+	if version == "" {
+		if v, ok := ctx.pkgJson.Dependencies[pkgName]; ok {
+			if strings.HasPrefix(v, "npm:") {
+				pkgName, version, _ = splitEsmPath(v[4:])
+			} else {
+				version = v
+			}
+		} else if v, ok = ctx.pkgJson.PeerDependencies[pkgName]; ok {
+			if strings.HasPrefix(v, "npm:") {
+				pkgName, version, _ = splitEsmPath(v[4:])
+			} else {
+				version = v
+			}
+		} else {
+			version = "latest"
 		}
 	}
-	return resovedConditions
+
+	packageJson, err = ctx.npmrc.getPackageInfoContext(ctx.Context(), pkgName, version)
+	if err == nil {
+		esm = EsmPath{
+			PkgName:    pkgName,
+			PkgVersion: packageJson.Version,
+			SubPath:    stripEntryModuleExt(subPath),
+		}
+	}
+	if err != nil && strings.HasSuffix(err.Error(), " not found") && isDts && !strings.HasPrefix(pkgName, "@types/") {
+		pkgName = npm.ToTypesPackageName(pkgName)
+		goto lookup
+	}
+	return
 }
 
-func getAllExportsPaths(om *OrderedMap) []string {
-	om.lock.RLock()
-	defer om.lock.RUnlock()
-	values := make([]string, 0, 5*len(om.keys))
-	for _, key := range om.keys {
-		v := om.m[key]
+func (ctx *BuildContext) lexer(entry *BuildEntry) (ret *BuildMeta, cjsExports []string, cjsReexport string, err error) {
+	if entry.main != "" && entry.module {
+		if strings.HasSuffix(entry.main, ".vue") || strings.HasSuffix(entry.main, ".svelte") {
+			ret = &BuildMeta{
+				ExportDefault: true,
+			}
+			return
+		}
+
+		var isESM bool
+		var namedExports []string
+		isESM, namedExports, err = validateJSFile(path.Join(ctx.wd, "node_modules", ctx.esmPath.PkgName, entry.main))
+		if err != nil {
+			return
+		}
+		if isESM {
+			ret = &BuildMeta{
+				ExportDefault: slices.Contains(namedExports, "default"),
+			}
+			return
+		}
+
+		var cjs cjsModuleLexerResult
+		cjs, err = cjsModuleLexer(ctx, entry.main)
+		if err != nil {
+			return
+		}
+
+		if DEBUG {
+			ctx.logger.Debugf("fake ES module '%s' of '%s'", entry.main, ctx.pkgJson.Name)
+		}
+
+		ret = &BuildMeta{
+			ExportDefault: true,
+			CJS:           true,
+		}
+		cjsExports = cjs.Exports
+		cjsReexport = cjs.Reexport
+		entry.module = false
+		return
+	}
+
+	if entry.main != "" && !entry.module {
+		var cjs cjsModuleLexerResult
+		cjs, err = cjsModuleLexer(ctx, entry.main)
+		if err != nil {
+			return
+		}
+		ret = &BuildMeta{
+			ExportDefault: true,
+			CJS:           true,
+		}
+		cjsExports = cjs.Exports
+		cjsReexport = cjs.Reexport
+		return
+	}
+
+	ret = &BuildMeta{}
+	return
+}
+
+func matchAsteriskExport(exportName string, subModuleName string) (diff string, match bool) {
+	if strings.ContainsRune(exportName, '*') {
+		prefix, suffix := utils.SplitByLastByte(exportName, '*')
+		if name := "./" + subModuleName; len(name) >= len(prefix)+len(suffix) && strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix) {
+			return name[len(prefix) : len(name)-len(suffix)], true
+		}
+	}
+	return "", false
+}
+
+func resloveAsteriskPathMapping(conditions npm.JSONObject, diff string) npm.JSONObject {
+	var keys []string
+	var values = map[string]any{}
+	for _, key := range conditions.Keys() {
+		value, ok := conditions.Get(key)
+		if ok {
+			if s, ok := value.(string); ok {
+				keys = append(keys, key)
+				values[key] = strings.ReplaceAll(s, "*", diff)
+			} else if c, ok := value.(npm.JSONObject); ok {
+				keys = append(keys, key)
+				values[key] = resloveAsteriskPathMapping(c, diff)
+			}
+		}
+	}
+	return npm.NewJSONObject(keys, values)
+}
+
+func getExportConditionPaths(condition npm.JSONObject) []string {
+	var values []string
+	for _, key := range condition.Keys() {
+		v, _ := condition.Get(key)
 		if s, ok := v.(string); ok {
 			values = append(values, s)
-		} else if om2, ok := v.(*OrderedMap); ok {
-			values = append(values, getAllExportsPaths(om2)...)
+		} else if condition, ok := v.(npm.JSONObject); ok {
+			values = append(values, getExportConditionPaths(condition)...)
 		}
 	}
 	return values
 }
 
-// make sure the entry is a relative specifier with extension
-func normalizeBuildEntry(ctx *BuildContext, entry *BuildEntry) {
-	if entry.esm != "" {
-		entry.esm = normalizeEntryPath(entry.esm)
-		if !endsWith(entry.esm, ".mjs", ".js") {
-			if ctx.existsPkgFile(entry.esm + ".mjs") {
-				entry.esm = entry.esm + ".mjs"
-			} else if ctx.existsPkgFile(entry.esm + ".js") {
-				entry.esm = entry.esm + ".js"
-			} else if ctx.existsPkgFile(entry.esm, "index.mjs") {
-				entry.esm = entry.esm + "/index.mjs"
-			} else if ctx.existsPkgFile(entry.esm, "index.js") {
-				entry.esm = entry.esm + "/index.js"
-			}
+// stripModuleExt strips the module extension from the given string.
+func stripModuleExt(s string) string {
+	for _, ext := range moduleExts {
+		if strings.HasSuffix(s, ext) && !strings.HasSuffix(s, ".d"+ext) {
+			return s[:len(s)-len(ext)]
 		}
 	}
-
-	if entry.cjs != "" {
-		entry.cjs = normalizeEntryPath(entry.cjs)
-		if !endsWith(entry.cjs, ".cjs", ".js") {
-			if ctx.existsPkgFile(entry.cjs + ".cjs") {
-				entry.cjs = entry.cjs + ".cjs"
-			} else if ctx.existsPkgFile(entry.cjs + ".js") {
-				entry.cjs = entry.cjs + ".js"
-			} else if ctx.existsPkgFile(entry.cjs, "index.cjs") {
-				entry.cjs = entry.cjs + "/index.cjs"
-			} else if ctx.existsPkgFile(entry.cjs, "index.js") {
-				entry.cjs = entry.cjs + "/index.js"
-			}
-		}
-		// check if the cjs entry is an ESM
-		if entry.cjs != "" && strings.HasSuffix(entry.cjs, ".js") {
-			isESM, _, _ := validateJSFile(path.Join(ctx.pkgDir, entry.cjs))
-			if isESM {
-				if entry.esm == "" {
-					entry.esm = entry.cjs
-				}
-				entry.cjs = ""
-			}
-		}
-	}
-
-	if entry.dts != "" {
-		entry.dts = normalizeEntryPath(entry.dts)
-	}
+	return s
 }
 
-func normalizeEntryPath(pathname string) string {
-	if isRelativeSpecifier(pathname) {
+// stripEntryModuleExt strips the entry module extension from the given string.
+func stripEntryModuleExt(s string) string {
+	if strings.HasSuffix(s, ".mjs") || strings.HasSuffix(s, ".cjs") {
+		return s[:len(s)-4]
+	}
+	if strings.HasSuffix(s, ".js") {
+		return s[:len(s)-3]
+	}
+	return s
+}
+
+func normalizeEntryPath(path string) string {
+	return "." + utils.NormalizePathname(path)
+}
+
+func normalizeSavePath(pathname string) string {
+	if strings.HasPrefix(pathname, "modules/transform/") || strings.HasPrefix(pathname, "modules/x/") {
 		return pathname
 	}
-	return "./" + strings.TrimPrefix(pathname, "/")
-}
-
-func normalizeSavePath(zoneId string, pathname string) string {
-	segs := strings.Split(pathname, "/")
-	for i, seg := range segs {
+	segments := strings.Split(pathname, "/")
+	for i, seg := range segments {
 		if strings.HasPrefix(seg, "X-") && len(seg) > 42 {
 			h := sha1.New()
 			h.Write([]byte(seg))
-			segs[i] = "X-" + hex.EncodeToString(h.Sum(nil))
+			segments[i] = "x-" + hex.EncodeToString(h.Sum(nil))
+		} else if strings.HasPrefix(seg, "*") {
+			segments[i] = seg[1:] + "/ea"
 		}
 	}
-	if zoneId != "" {
-		return zoneId + "/" + strings.Join(segs, "/")
+	return strings.Join(segments, "/")
+}
+
+// normalizeImportSpecifier normalizes the given specifier.
+func normalizeImportSpecifier(specifier string) string {
+	switch specifier {
+	case ".":
+		specifier = "./index"
+	case "..":
+		specifier = "../index"
+	default:
+		specifier = strings.TrimPrefix(specifier, "npm:")
 	}
-	return strings.Join(segs, "/")
+	if nodeBuiltinModules[specifier] {
+		return "node:" + specifier
+	}
+	return specifier
+}
+
+// validateJSFile validates javascript/typescript module from the given file.
+func validateJSFile(filename string) (isESM bool, namedExports []string, err error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return
+	}
+	log := logger.NewDeferLog(logger.DeferLogNoVerboseOrDebug, nil)
+	parserOpts := js_parser.OptionsFromConfig(&esbuild_config.Options{
+		JSX: esbuild_config.JSXOptions{
+			Parse: endsWith(filename, ".jsx", ".tsx"),
+		},
+		TS: esbuild_config.TSOptions{
+			Parse: endsWith(filename, ".ts", ".mts", ".cts", ".tsx"),
+		},
+	})
+	ast, pass := js_parser.Parse(log, logger.Source{
+		Index:          0,
+		KeyPath:        logger.Path{Text: "<stdin>"},
+		PrettyPaths:    logger.PrettyPaths{Rel: "<stdin>"},
+		IdentifierName: "stdin",
+		Contents:       string(data),
+	}, parserOpts)
+	if !pass {
+		err = errors.New("invalid syntax, require javascript/typescript")
+		return
+	}
+	isESM = ast.ExportsKind == js_ast.ExportsESM || ast.ExportsKind == js_ast.ExportsESMWithDynamicFallback
+	// A module with no import/export/CommonJS markers (e.g. an empty file that
+	// contains only comments, as shipped by some types-only packages) is parsed
+	// as `ExportsNone`. For explicit ES module files (`.mjs`/`.mts`) such a file
+	// is still a valid—if empty—ES module and must be treated as ESM. Otherwise
+	// it would be misclassified as a "fake CommonJS module" and handed to the
+	// cjs-module-lexer, which can panic while resolving the entry's `exports`
+	// subpath under non-matching conditions (e.g. a `browser`-only build).
+	if !isESM && ast.ExportsKind == js_ast.ExportsNone && endsWith(filename, ".mjs", ".mts") {
+		isESM = true
+	}
+	namedExports = make([]string, len(ast.NamedExports))
+	i := 0
+	for name := range ast.NamedExports {
+		namedExports[i] = name
+		i++
+	}
+	return
 }

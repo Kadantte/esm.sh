@@ -1,76 +1,94 @@
-![esm.sh](./server/embed/assets/og-image.svg)
+![esm.sh](./server/embed/images/banner.svg)
 
 <p align="left">
-  <a href= "https://github.com/esm-dev/esm.sh/pkgs/container/esm.sh"><img src="https://img.shields.io/github/v/tag/esm-dev/esm.sh?label=Docker&display_name=tag&style=flat&colorA=232323&colorB=232323&logo=docker&logoColor=eeeeee" alt="Docker"></a>
   <a href="https://discord.gg/XDbjMeb7pb"><img src="https://img.shields.io/discord/1097820016893763684?style=flat&colorA=232323&colorB=232323&label=Discord&logo=&logoColor=eeeeee" alt="Discord"></a>
-  <a href="https://github.com/sponsors/ije"><img src="https://img.shields.io/github/sponsors/ije?label=Sponsors&style=flat&colorA=232323&colorB=232323&logo=&logoColor=eeeeee" alt="Sponsors"></a>
+  <a href="https://github.com/sponsors/esm-dev"><img src="https://img.shields.io/github/sponsors/esm-dev?label=GitHub%20Sponsors&style=flat&colorA=232323&colorB=232323&logo=&logoColor=eeeeee" alt="GitHub Sponsors"></a>
+  <a href="https://opencollective.com/esm"><img src="https://img.shields.io/opencollective/all/esm?label=Open%20Collective&style=flat&colorA=232323&colorB=232323&logo=&logoColor=eeeeee" alt="Open Collective"></a>
 </p>
 
 # esm.sh
 
-A global, fast & smart content delivery network(CDN) for modern(es2015+) web development.
+A _no-build_ JavaScript CDN for modern web development.
 
 ## How to Use
 
-esm.sh allows you to import [JavaScirpt(ES6) modules](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Modules) from NPM/GitHub in browser. No installation/build steps needed.
+esm.sh allows you to import [JavaScript modules](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Modules) from http URLs, **no installation/build steps needed.**
 
 ```js
 import * as mod from "https://esm.sh/PKG[@SEMVER][/PATH]";
 ```
 
-With [import maps](https://github.com/WICG/import-maps), you can even use bare import specifiers intead of full URLs.
+With [import maps](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/script/type/importmap), you can even use bare import specifiers instead of URLs:
 
 ```html
 <script type="importmap">
-{
-  "imports": {
-    "react": "https://esm.sh/react@18.2.0"
+  {
+    "imports": {
+      "react": "https://esm.sh/react@19.2.4",
+      "react-dom/": "https://esm.sh/react-dom@19.2.4/"
+    }
   }
-}
 </script>
 <script type="module">
-  import React from "react" // alias to https://esm.sh/react@18.2.0
+  import React from "react"; // → https://esm.sh/react@19.2.4
+  import { render } from "react-dom/client"; // → https://esm.sh/react-dom@19.2.4/client
 </script>
 ```
 
-> More details check out [here](#using-import-maps).
+> More usages about import maps can be found in the [**Using Import Maps**](#using-import-maps) section.
 
 ### Supported Registries
 
 - **[NPM](https://npmjs.com)**:
   ```js
   // Examples
-  import React from "https://esm.sh/react"; // 18.3.0 (latest)
-  import React from "https://esm.sh/react@17"; // 17.0.2
-  import React from "https://esm.sh/react@beta"; // 19.0.0-beta-94eed63c49-20240425
-  import { renderToString } from "https://esm.sh/react-dom@18.3.0/server"; // submodules
-  ```
-- **[Github](https://github.com)** (starts with `/gh/`):
-  ```js
-  // Examples
-  import tslib from "https://esm.sh/gh/microsoft/tslib@2.6.0"; // '2.6.0' is the git tag name
-  // or fetch an asset file from github
-  fetch("https://esm.sh/gh/microsoft/fluentui-emoji/assets/Party%20popper/Color/party_popper_color.svg");
+  import React from "https://esm.sh/react"; // latest
+  import React from "https://esm.sh/react@18"; // 18.3.1
+  import React from "https://esm.sh/react@beta"; // latest beta
+  import { renderToString } from "https://esm.sh/react-dom/server"; // sub-modules
   ```
 - **[JSR](https://jsr.io)** (starts with `/jsr/`):
   ```js
   // Examples
-  import * as mod from "https://esm.sh/jsr/@std/encoding@0.222.0/base64";
-  import { html } from "https://esm.sh/jsr/@mark/html@1";
+  import { encodeBase64 } from "https://esm.sh/jsr/@std/encoding@1.0.0/base64";
+  import { Hono } from "https://esm.sh/jsr/@hono/hono@4";
   ```
+- **[GitHub](https://github.com)** (starts with `/gh/`):
+  ```js
+  // Examples
+  import tslib from "https://esm.sh/gh/microsoft/tslib"; // latest
+  import tslib from "https://esm.sh/gh/microsoft/tslib@d72d6f7"; // with commit hash
+  import tslib from "https://esm.sh/gh/microsoft/tslib@v2.8.0"; // with tag
+  ```
+- **[pkg.pr.new](https://pkg.pr.new)** (starts with `/pr/` or `/pkg.pr.new/`):
+  ```js
+  // Examples
+  import { Bench } from "https://esm.sh/pr/tinylibs/tinybench/tinybench@a832a55";
+  import { Bench } from "https://esm.sh/pr/tinybench@a832a55"; // --compact
+  ```
+
+### Transforming `.ts(x)`/`.vue`/`.svelte` on the Fly
+
+esm.sh allows you to import `.ts(x)`, `.vue`, and `.svelte` files directly in the browser without any build steps.
+
+```js
+import { Airplay } from "https://esm.sh/gh/phosphor-icons/react@v2.1.5/src/csr/Airplay.tsx?deps=react@19.2.4";
+import IconAirplay from "https://esm.sh/gh/phosphor-icons/vue@v2.2.0/src/icons/PhAirplay.vue?deps=vue@3.5.8";
+```
 
 ### Specifying Dependencies
 
 By default, esm.sh rewrites import specifiers based on the package dependencies. To specify the version of these
-dependencies, you can add the `?deps=PACKAGE@VERSION` query. To specify multiple dependencies, separate them with a
-comma, like this: `?deps=react@17.0.2,react-dom@17.0.2`.
+dependencies, you can add `?deps=PACKAGE@VERSION` to the import URL. To specify multiple dependencies, separate them with commas, like this: `?deps=react@18.3.1,react-dom@18.3.1`.
 
 ```js
-import React from "https://esm.sh/react@17.0.2";
-import useSWR from "https://esm.sh/swr?deps=react@17.0.2";
+import React from "https://esm.sh/react@18.3.1";
+import useSWR from "https://esm.sh/swr?deps=react@18.3.1";
 ```
 
 ### Aliasing Dependencies
+
+You can also alias dependencies by adding `?alias=PACKAGE:ALIAS` to the import URL. This is useful when you want to use a different package for a dependency.
 
 ```js
 import useSWR from "https://esm.sh/swr?alias=react:preact/compat";
@@ -82,7 +100,61 @@ in combination with `?deps`:
 import useSWR from "https://esm.sh/swr?alias=react:preact/compat&deps=preact@10.5.14";
 ```
 
-The original idea came from [@lucacasonato](https://github.com/lucacasonato).
+### Bundling Strategy
+
+By default, esm.sh bundles sub-modules of a package that are not shared by entry modules defined in the `exports` field of `package.json`.
+
+Bundling sub-modules can reduce the number of network requests, improving performance. However, it may result in repeated bundling of shared modules. In extreme cases, this can break package side effects or alter the `import.meta.url` semantics. To prevent this, you can disable the default bundling behavior by adding `?bundle=false`:
+
+```js
+import "https://esm.sh/@pyscript/core?bundle=false";
+```
+
+For package authors, it is recommended to define the `exports` field in `package.json`. This specifies the entry modules of the package, allowing esm.sh to accurately analyze the dependency tree and bundle the modules without duplication.
+
+```jsonc
+{
+  "name": "foo",
+  "exports": {
+    ".": {
+      "import": "./index.js",
+      "require": "./index.cjs",
+      "types": "./index.d.ts"
+    },
+    "./submodule": {
+      "import": "./submodule.js",
+      "require": "./submodule.cjs",
+      "types": "./submodule.d.ts"
+    }
+  }
+}
+```
+
+Or you can override the bundling strategy by adding the `esm.sh` field to your `package.json`:
+
+```jsonc
+{
+  "name": "foo",
+  "esm.sh": {
+    "bundle": false // disables the default bundling behavior
+  }
+}
+```
+
+You can also add the `?standalone` flag to bundle the module along with all its external dependencies (excluding those in `peerDependencies`) into a single JavaScript file.
+
+```js
+import { Button } from "https://esm.sh/antd?standalone";
+```
+
+You can disable the default transforming/bundling behavior by adding `?raw` query to the import URL.
+
+```js
+import { render } from "https://esm.sh/preact?raw";
+```
+
+> [!TIP]
+> The `?raw` query is useful when you want to import the raw JavaScript source code of a package, as-is, without transformation into ES modules.
 
 ### Tree Shaking
 
@@ -94,55 +166,26 @@ import { __await, __rest } from "https://esm.sh/tslib"; // 7.3KB
 import { __await, __rest } from "https://esm.sh/tslib?exports=__await,__rest"; // 489B
 ```
 
-By using this feature, you can take advantage of tree shaking with esbuild and achieve a smaller bundle size. **Note**
-that this feature is only supported for ESM modules and not CJS modules.
+By using this feature, you can take advantage of tree shaking with esbuild and achieve a smaller bundle size. **Note,
+this feature doesn't work with CommonJS modules.**
 
-### Bundling Strategy
-
-By default, esm.sh bundles sub-modules that ain't declared in the `exports` field.
-
-Bundling sub-modules can reduce the number of network requests for performance. However, it may bundle shared modules
-repeatedly. In extreme case, it may break the side effects of the package, or change the `import.meta.url` semantics. To
-avoid this, you can add `?bundle=false` to disable the default bundling behavior:
-
-```js
-import "https://esm.sh/@pyscript/core?bundle=false";
-```
-
-For package authors, you can override the bundling strategy by adding the `esm.sh` field to `package.json`:
-
-```jsonc
-{
-  "name": "foo",
-  "esm.sh": {
-    "bundle": false // disables the default bundling behavior
-  }
-}
-```
-
-esm.sh also supports `?bundle=all` query to bundle the module with all external dependencies(except in `peerDependencies`) into a single JS file.
-
-```js
-import { Button } from "https://esm.sh/antd?bundle=all";
-```
-
-### Development Mode
+### Development Build
 
 ```js
 import React from "https://esm.sh/react?dev";
 ```
 
-With the `?dev` option, esm.sh builds a module with `process.env.NODE_ENV` set to `"development"` or based on the
+With the `?dev` query, esm.sh builds a module with `process.env.NODE_ENV` set to `"development"` or based on the
 condition `development` in the `exports` field. This is useful for libraries that have different behavior in development
 and production. For example, React uses a different warning message in development mode.
 
 ### ESBuild Options
 
 By default, esm.sh checks the `User-Agent` header to determine the build target. You can also specify the `target` by
-adding `?target`, available targets are: **es2015** - **es2022**, **esnext**, **deno**, **denonext**, and **node**.
+adding `?target`, available targets are: **es2015** - **es2024**, **esnext**, **deno**, **denonext**, and **node**.
 
 ```js
-import React from "https://esm.sh/react?target=esnext";
+import React from "https://esm.sh/react?target=es2022";
 ```
 
 Other supported options of esbuild:
@@ -160,6 +203,17 @@ Other supported options of esbuild:
   import foo from "https://esm.sh/foo?ignore-annotations";
   ```
 
+### CSS-In-JS
+
+esm.sh supports importing CSS files in JS directly:
+
+```html
+<link rel="stylesheet" href="https://esm.sh/monaco-editor?css">
+```
+
+> [!IMPORTANT]
+> This only works when the package **imports CSS files in JS** directly.
+
 ### Web Worker
 
 esm.sh supports `?worker` query to load the module as a web worker:
@@ -176,7 +230,7 @@ const worker = createWorker({ inject: "self.onmessage = (e) => self.postMessage(
 ```
 
 You can import any module as a worker from esm.sh with the `?worker` query. Plus, you can access the module's exports in the
-`inject` code. For example, uing the `xxhash-wasm` to hash strings in a worker:
+`inject` code. For example, use the `xxhash-wasm` to hash strings in a worker:
 
 ```js
 import createWorker from "https://esm.sh/xxhash-wasm@1.0.2?worker";
@@ -194,42 +248,31 @@ worker.onmessage = (e) => console.log("hash is", e.data);
 worker.postMessage("The string that is being hashed");
 ```
 
-> Note: The `inject` parameter must be a valid JavaScript code, and it will be executed in the worker context.
-
-### Package CSS
-
-```html
-<link rel="stylesheet" href="https://esm.sh/monaco-editor?css">
-```
-
-This only works when the package **imports CSS files in JS** directly.
-
-### Importing WASM as Module
-
-esm.sh supports importing wasm modules in JS directly, to do that, you need to add `?module` query to the import URL:
-
-```js
-import wasm from "https://esm.sh/@dqbd/tiktoken@1.0.3/tiktoken_bg.wasm?module";
-
-const { exports } = new WebAssembly.Instance(wasm, imports);
-```
-
-> Note: The `*.wasm?module` pattern requires the [top-level-await](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/await#top_level_await) feature to be supported by the browser.
+> [!IMPORTANT]
+> The `inject` parameter must be a valid JavaScript code, and it will be executed in the worker context.
 
 ## Using Import Maps
 
-[**Import Maps**](https://github.com/WICG/import-maps) has been supported by most modern browsers and Deno natively.
+[**Import Maps**](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/script/type/importmap) has been supported by most modern browsers and Deno natively.
 This allows _**bare import specifiers**_, such as `import React from "react"`, to work.
 
-esm.sh introduces the `?external=foo,bar` query for specifying external dependencies. By employing this query, esm.sh maintains the import specifier intact, leaving it to the browser/Deno to resolve based on the import map. For example:
+esm.sh introduces the `?external` for specifying external dependencies. By employing this query, esm.sh maintains the import specifier intact, leaving it to the browser/Deno to resolve based on the import map. For example:
 
-```json
+```html
+<script type="importmap">
 {
   "imports": {
     "preact": "https://esm.sh/preact@10.7.2",
+    "preact/": "https://esm.sh/preact@10.7.2/",
     "preact-render-to-string": "https://esm.sh/preact-render-to-string@5.2.0?external=preact"
   }
 }
+</script>
+<script type="module">
+  import { h } from "preact";
+  import { useState } from "preact/hooks";
+  import { render } from "preact-render-to-string";
+</script>
 ```
 
 Alternatively, you can **mark all dependencies as external** by adding a `*` prefix before the package name:
@@ -245,30 +288,112 @@ Alternatively, you can **mark all dependencies as external** by adding a `*` pre
 }
 ```
 
-Import maps supports [**trailing slash**](https://github.com/WICG/import-maps#packages-via-trailing-slashes) that can
+Import maps supports [**trailing slash**](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/script/type/importmap#packages-via-trailing-slashes) that can
 not work with URL search params friendly. To fix this issue, esm.sh provides a special format for import URL that allows
 you to use query params with trailing slash: change the query prefix `?` to `&` and put it after the package version.
 
 ```json
 {
   "imports": {
-    "react-dom": "https://esm.sh/react-dom@18.2.0?dev",
-    "react-dom/": "https://esm.sh/react-dom@18.2.0&dev/"
+    "react-dom": "https://esm.sh/react-dom@19.2.4?dev",
+    "react-dom/": "https://esm.sh/react-dom@19.2.4&dev/"
   }
 }
 ```
 
 ## Escape Hatch: Raw Source Files
 
-In rare cases, you may want to request JS source files from packages, as-is, without transformation into ES modules. To
-do so, you need to add a `?raw` query to the request URL.
+By default, esm.sh transforms (and bundles if necessary) the JavaScript source code. However, in rare cases, you may want to request JS source files from packages, as-is, without transformation into ES modules. To do so, you need to add a `?raw` query to the request URL.
+
+The `raw` mode works just like other CDN services, unpkg.com(https://unpkg.com/), jsdelivr.net(https://www.jsdelivr.net/), etc.
 
 ```html
 <script src="https://esm.sh/p5/lib/p5.min.js?raw"></script>
 ```
 
-> You may alternatively use `raw.esm.sh/<PATH>` as the origin, which is equivalent to `esm.sh/<PATH>?raw`,
+> [!TIP]
+> You may alternatively use `https://raw.esm.sh/<PATH>`, which is equivalent to `https://esm.sh/<PATH>?raw`,
 > that transitive references in the raw assets will also be raw requests.
+
+## Purge Cache
+
+esm.sh builds and caches every module so it can be served instantly and immutably. The [**Cache Purge**
+page](https://esm.sh/purge) refreshes the cache after you publish (or republish) a version:
+
+- an **exact version** (`react@19.0.0`) drops its artifacts — built modules, type declarations, the local
+  npm store and the resolution cache — so the next request rebuilds it from scratch;
+- a **bare name, dist-tag, range or branch** (`react`, `react@next`, `react@^18`, `gh/user/repo@main`) only
+  refreshes the version resolution: the next request re-resolves and rebuilds only if the version or commit
+  actually moved, otherwise the existing build is reused.
+
+This works like [jsDelivr's purge tool](https://www.jsdelivr.com/tools/purge):
+
+```bash
+# 1. fetch a proof-of-work challenge
+challenge=$(curl -s "https://esm.sh/pow/challenge?scope=purge")
+id=$(echo "$challenge" | jq -r .id)
+salt=$(echo "$challenge" | jq -r .salt)
+difficulty=$(echo "$challenge" | jq -r .difficulty)
+
+# 2. solve it (SHA-256 prefix proof-of-work, takes a moment)
+nonce=0
+prefix=$(printf '0%.0s' $(seq 1 "$difficulty"))
+while ! [[ "$(printf '%s%s' "$salt" "$nonce" | sha256sum)" == "$prefix"* ]]; do
+  nonce=$((nonce + 1))
+done
+
+# 3. purge
+curl -X POST https://esm.sh/purge \
+  -H "content-type: application/json" \
+  -d "{\"url\": \"https://esm.sh/@scope/pkg@1.0.1\", \"challenge\": \"$id\", \"nonce\": \"$nonce\"}"
+```
+
+You can pass a full URL or a bare specifier (`pkg`, `pkg@version`, `@scope/pkg`, `gh/user/repo@ref`); the
+JSON response reports the resolved package/version, the removed artifacts and resolution keys, and a URL to
+trigger the next request. The bare-name URL follows the new version right after a refresh, no need to wait
+out the npm query cache TTL.
+
+Every purge requires solving a proof-of-work challenge (the page solves it automatically in the browser), so
+mass purge-and-rebuild attacks are not free. The challenge endpoint is generic:
+`GET /pow/challenge?scope=<scope>`, currently the `purge` scope.
+
+For self-hosted servers, see [Cache Purge configuration](./HOSTING.md#cache-purge) for GitHub login, Cloudflare cache purging, and disabling the API.
+
+## Using `esm.sh/tsx`
+
+`esm.sh/tsx` is a lightweight **1KB** script that allows you to write `TSX` directly in HTML without any build steps. Your source code is sent to the server, compiled, cached at the edge, and served to the browser as a JavaScript module.
+
+`esm.sh/tsx` supports `<script>` tags with `type` set to `text/babel`, `text/jsx`, `text/ts`, or `text/tsx`.
+
+In development mode (open the page on localhost), `esm.sh/tsx` uses [@esm.sh/tsx](https://github.com/esm-dev/tsx) to transform JSX syntax into JavaScript.
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+  <script type="importmap">
+    {
+      "imports": {
+        "react/jsx-runtime": "https://esm.sh/react@19.2.4/jsx-runtime",
+        "react-dom/client": "https://esm.sh/react-dom@19.2.4/client"
+      }
+    }
+  </script>
+  <script type="module" src="https://esm.sh/tsx"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    import { createRoot } from "react-dom/client"
+    const root = document.getElementById("root")
+    createRoot(root).render(<h1>Hello, World!</h1>)
+  </script>
+</body>
+</html>
+```
+
+> [!TIP]
+> To transform JSX syntax, you need to specify the `[PKG]/jsx-runtime` import in the `importmap` script.
 
 ## Deno Compatibility
 
@@ -289,7 +414,7 @@ Deno supports type definitions for modules with a `types` field in their `packag
 `X-TypeScript-Types` header. This makes it possible to have type checking and auto-completion when using those modules
 in Deno. ([link](https://deno.land/manual/typescript/types#using-x-typescript-types-header)).
 
-![Figure #1](./server/embed/assets/sceenshot-deno-types.png)
+![Figure #1](./server/embed/images/fig-x-typescript-types.png)
 
 In case the type definitions provided by the `X-TypeScript-Types` header is incorrect, you can disable it by adding the
 `?no-dts` query to the module import URL:
@@ -301,16 +426,31 @@ import unescape from "https://esm.sh/lodash/unescape?no-dts";
 This will prevent the `X-TypeScript-Types` header from being included in the network request, and you can manually
 specify the types for the imported module.
 
-## Supporting Nodejs/Bun
+## esm.sh Configuration
 
-Nodejs(18+) supports http importing under the `--experimental-network-imports` flag. Bun doesn't support http modules
-yet.
+esm.sh supports configuring the build options by adding the `esm.sh` field to your `package.json`:
 
-We highly recommend [Reejs](https://ree.js.org/) as the runtime with esm.sh that works both in Nodejs and Bun.
+```jsonc
+{
+  "name": "your-package",
+  "esm.sh": {
+    // set to false to disable the default bundling behavior
+    "bundle": true,
+    // set to true to prevent class/function names erasing
+    "keepNames": false,
+    // set to true to ignore side-effect annotations
+    "ignoreAnnotations": false
+  }
+}
+```
+
+## Supporting Node.js/Bun
+
+esm.sh is not supported by Node.js/Bun currently.
 
 ## Global CDN
 
-<img width="150" align="right" src="./server/embed/assets/cf.svg" />
+<img width="150" align="right" src="./server/embed/images/cloudflare.svg" />
 
 The Global CDN of esm.sh is provided by [Cloudflare](https://cloudflare.com), one of the world's largest and fastest
 cloud network platforms.
@@ -318,3 +458,7 @@ cloud network platforms.
 ## Self-Hosting
 
 To host esm.sh by yourself, check the [hosting](./HOSTING.md) documentation.
+
+## License
+
+Under the [MIT](./LICENSE) license.

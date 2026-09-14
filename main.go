@@ -1,15 +1,9 @@
 package main
 
 import (
-	"embed"
-
-	"github.com/esm-dev/esm.sh/server"
+	"github.com/esm-dev/esm.sh/cli"
 )
 
-//go:embed README.md
-//go:embed server/embed
-var fs embed.FS
-
 func main() {
-	server.Serve(&fs)
+	cli.Run()
 }

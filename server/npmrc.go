@@ -1,0 +1,831 @@
+package server
+
+import (
+	"archive/tar"
+	"compress/gzip"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/Masterminds/semver/v3"
+	"github.com/esm-dev/esm.sh/internal/npm"
+	"github.com/ije/gox/set"
+	syncx "github.com/ije/gox/sync"
+	"github.com/ije/gox/term"
+	"github.com/ije/gox/utils"
+)
+
+const (
+	npmRegistry = "https://registry.npmjs.org/"
+	jsrRegistry = "https://npm.jsr.io/"
+)
+
+var (
+	defaultNpmRC *NpmRC
+	installMutex syncx.KeyedMutex
+)
+
+type NpmRegistry struct {
+	NpmRegistryConfig
+	versionRouteSupported atomic.Uint32
+	rateLimited           atomic.Uint32
+}
+
+type NpmRC struct {
+	globalRegistry   *NpmRegistry
+	scopedRegistries map[string]*NpmRegistry
+}
+
+func DefaultNpmRC() *NpmRC {
+	if defaultNpmRC != nil {
+		return defaultNpmRC
+	}
+	globalRegistry := &NpmRegistry{
+		NpmRegistryConfig: NpmRegistryConfig{
+			Registry:       config.NpmRegistry,
+			BackupRegistry: config.NpmBackupRegistry,
+			Token:          config.NpmToken,
+			User:           config.NpmUser,
+			Password:       config.NpmPassword,
+		},
+	}
+	defaultNpmRC = &NpmRC{
+		globalRegistry: globalRegistry,
+		scopedRegistries: map[string]*NpmRegistry{
+			"@jsr": {
+				NpmRegistryConfig: NpmRegistryConfig{
+					Registry: jsrRegistry,
+				},
+			},
+		},
+	}
+	if len(config.NpmScopedRegistries) > 0 {
+		for scope, reg := range config.NpmScopedRegistries {
+			defaultNpmRC.scopedRegistries[scope] = &NpmRegistry{
+				NpmRegistryConfig: reg,
+			}
+		}
+	}
+	return defaultNpmRC
+}
+
+func (rc *NpmRC) StoreDir() string {
+	return filepath.Join(config.WorkDir, "npm")
+}
+
+func (npmrc *NpmRC) getRegistryByPackageName(packageName string) *NpmRegistry {
+	if strings.HasPrefix(packageName, "@") {
+		scope, _ := utils.SplitByFirstByte(packageName, '/')
+		reg, ok := npmrc.scopedRegistries[scope]
+		if ok {
+			return reg
+		}
+	}
+	return npmrc.globalRegistry
+}
+
+func (npmrc *NpmRC) fetchPackageMetadataContext(ctx context.Context, pkgName string, version string, isWellknownVersion bool) (*npm.PackageMetadata, *npm.PackageJSONRaw, error) {
+	reg := npmrc.getRegistryByPackageName(pkgName)
+	regUrlStr := reg.Registry
+	if reg.isRateLimited() && reg.BackupRegistry != "" {
+		// use backup registry if the global registry is rate limited
+		regUrlStr = reg.BackupRegistry
+	}
+	regUrlStr += pkgName
+
+	var useVersionRoute bool
+	if isWellknownVersion {
+		useVersionRoute = reg.isSupportVersionRoute(regUrlStr)
+		if useVersionRoute {
+			regUrlStr += "/" + version
+		}
+	}
+
+	regUrl, err := url.Parse(regUrlStr)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	header := http.Header{}
+	if reg.Token != "" {
+		header.Set("Authorization", "Bearer "+reg.Token)
+	} else if reg.User != "" && reg.Password != "" {
+		header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(reg.User+":"+reg.Password)))
+	}
+
+	if DEBUG {
+		fmt.Println(term.Dim(fmt.Sprintf("Fetching %s...", regUrl.String())))
+	}
+
+	fetchClient := newFetchClient("esmd/"+VERSION, 15)
+
+	retryTimes := 0
+RETRY:
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	res, err := fetchClient.FetchWithContext(ctx, regUrl, header)
+	if err != nil {
+		if retryTimes < 3 {
+			retryTimes++
+			if sleepErr := sleepWithContext(ctx, time.Duration(retryTimes)*100*time.Millisecond); sleepErr != nil {
+				return nil, nil, sleepErr
+			}
+			goto RETRY
+		}
+		return nil, nil, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode == 404 || res.StatusCode == 401 {
+		if isWellknownVersion && version != "latest" {
+			return nil, nil, fmt.Errorf("version %s of '%s' not found", version, pkgName)
+		} else {
+			return nil, nil, fmt.Errorf("package '%s' not found", pkgName)
+		}
+	}
+
+	if res.StatusCode == 429 && reg.BackupRegistry != "" && !reg.isRateLimited() {
+		reg.hitRateLimit()
+		return npmrc.fetchPackageMetadataContext(ctx, pkgName, version, isWellknownVersion)
+	}
+
+	if res.StatusCode != 200 {
+		return nil, nil, fmt.Errorf("%s: %s", regUrl.Hostname(), res.Status)
+	}
+
+	if isWellknownVersion && useVersionRoute {
+		var raw npm.PackageJSONRaw
+		err = json.NewDecoder(res.Body).Decode(&raw)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, &raw, nil
+	}
+
+	var metadata npm.PackageMetadata
+	err = json.NewDecoder(res.Body).Decode(&metadata)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if len(metadata.Versions) == 0 {
+		return nil, nil, fmt.Errorf("version %s of '%s' not found", version, pkgName)
+	}
+
+	return &metadata, nil, nil
+}
+
+func resolveSemverVersion(metadata *npm.PackageMetadata, version string) (string, error) {
+CHECK:
+	distVersion, ok := metadata.DistTags[version]
+	if ok {
+		_, ok := metadata.Versions[distVersion]
+		if ok {
+			return distVersion, nil
+		}
+	} else {
+		if version == "latest" {
+			return "", fmt.Errorf("version %s not found", version)
+		}
+		c, err := semver.NewConstraint(version)
+		if err != nil {
+			version = "latest"
+			goto CHECK
+		}
+		var latest *semver.Version
+		includePrerelease := strings.ContainsRune(version, '-')
+		for v := range metadata.Versions {
+			if !includePrerelease && strings.ContainsRune(v, '-') {
+				continue
+			}
+			sv, err := semver.NewVersion(v)
+			if err == nil && c.Check(sv) && (latest == nil || sv.GreaterThan(latest)) {
+				latest = sv
+			}
+		}
+		if latest != nil {
+			return latest.Original(), nil
+		}
+	}
+	return "", fmt.Errorf("version %s not found", version)
+}
+
+func (npmrc *NpmRC) getPackageInfo(pkgName string, version string) (packageJson *npm.PackageJSON, err error) {
+	return npmrc.getPackageInfoContext(context.Background(), pkgName, version)
+}
+
+func (npmrc *NpmRC) getPackageInfoContext(ctx context.Context, pkgName string, version string) (packageJson *npm.PackageJSON, err error) {
+	if pkgName == "" {
+		return nil, errors.New("package name is empty")
+	}
+
+	version = npm.NormalizePackageVersion(version)
+
+	if msg, ok := getCacheItem("404:" + pkgName + "@" + version); ok {
+		return nil, errors.New(msg.(string))
+	}
+
+	ttl := time.Duration(config.NpmQueryCacheTTL) * time.Second
+	return withCache("npm:"+pkgName+"@"+version, ttl, func() (*npm.PackageJSON, string, error) {
+		if npm.IsExactVersion(version) {
+			var raw npm.PackageJSONRaw
+			pkgJsonPath := filepath.Join(npmrc.StoreDir(), pkgName+"@"+version, "node_modules", pkgName, "package.json")
+			if utils.ParseJSONFile(pkgJsonPath, &raw) == nil {
+				return raw.ToNpmPackage(), "", nil
+			}
+		}
+
+		metadata, raw, err := npmrc.fetchPackageMetadataContext(ctx, pkgName, version, npm.IsExactVersion(version) || npm.IsDistTag(version))
+		if err != nil {
+			if msg := err.Error(); strings.HasSuffix(msg, "not found") {
+				setCacheItem("404:"+pkgName+"@"+version, msg, ttl)
+			}
+			return nil, "", err
+		}
+
+		if raw != nil {
+			return raw.ToNpmPackage(), "npm:" + pkgName + "@" + raw.Version, nil
+		}
+
+		resolvedVersion, err := resolveSemverVersion(metadata, version)
+		if err != nil {
+			return nil, "", fmt.Errorf("version %s of '%s' not found", version, pkgName)
+		}
+
+		rawData, ok := metadata.Versions[resolvedVersion]
+		if !ok {
+			return nil, "", fmt.Errorf("version %s of '%s' not found", version, pkgName)
+		}
+
+		return rawData.ToNpmPackage(), "npm:" + pkgName + "@" + rawData.Version, nil
+	})
+}
+
+// invalidateDistTagCacheIfNewer drops the cached "latest" (and its 404)
+// resolution of pkgName once a newer exact version has been built
+// successfully, so the default (bare-name) URL follows it without waiting for
+// the npm query cache TTL. Only call it after a build succeeds: replaying it
+// at resolution time would keep forcing npm re-queries and could pin the
+// default URL to a version whose build fails.
+func invalidateDistTagCacheIfNewer(pkgName string, version string) {
+	version = npm.NormalizePackageVersion(version)
+	if !npm.IsExactVersion(version) {
+		return
+	}
+	key := "npm:" + pkgName + "@latest"
+	v, _ := getCacheItem(key)
+	latest, ok := v.(*npm.PackageJSON)
+	if !ok || !semverLessThan(latest.Version, version) {
+		return
+	}
+	deleteCacheItem(key)
+	deleteCacheItem("404:" + pkgName + "@latest")
+}
+
+func (npmrc *NpmRC) getPackageInfoByDate(pkgName string, targetDate time.Time) (packageJson *npm.PackageJSON, err error) {
+	return npmrc.getPackageInfoByDateContext(context.Background(), pkgName, targetDate)
+}
+
+func (npmrc *NpmRC) getPackageInfoByDateContext(ctx context.Context, pkgName string, targetDate time.Time) (packageJson *npm.PackageJSON, err error) {
+	reg := npmrc.getRegistryByPackageName(pkgName)
+	targetTimeStr := targetDate.Format(time.DateOnly)
+	cacheKey := reg.Registry + pkgName + "@date=" + targetTimeStr
+
+	return withCache(cacheKey, time.Duration(config.NpmQueryCacheTTL)*time.Second, func() (*npm.PackageJSON, string, error) {
+		metadata, _, err := npmrc.fetchPackageMetadataContext(ctx, pkgName, "", false)
+		if err != nil {
+			return nil, "", err
+		}
+
+		resolvedVersion, err := npm.ResolveVersionByTime(metadata, targetDate)
+		if err != nil {
+			return nil, "", fmt.Errorf("date-based version resolution failed for %s@%s: %s", pkgName, targetTimeStr, err.Error())
+		}
+
+		raw, ok := metadata.Versions[resolvedVersion]
+		if !ok {
+			return nil, "", fmt.Errorf("resolved version %s of '%s' not found", resolvedVersion, pkgName)
+		}
+
+		exactVersionCacheKey := reg.Registry + pkgName + "@" + raw.Version
+		return raw.ToNpmPackage(), exactVersionCacheKey, nil
+	})
+}
+
+func (npmrc *NpmRC) installPackage(pkg npm.Package) (packageJson *npm.PackageJSON, err error) {
+	return npmrc.installPackageContext(context.Background(), pkg)
+}
+
+func (npmrc *NpmRC) installPackageContext(ctx context.Context, pkg npm.Package) (packageJson *npm.PackageJSON, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	installDir := filepath.Join(npmrc.StoreDir(), pkg.String())
+	packageJsonPath := filepath.Join(installDir, "node_modules", pkg.Name, "package.json")
+
+	// check if the package has been installed
+	var raw npm.PackageJSONRaw
+	if utils.ParseJSONFile(packageJsonPath, &raw) == nil {
+		packageJson = raw.ToNpmPackage()
+		return
+	}
+
+	// only one installation process is allowed at the same time for the same package
+	unlock := installMutex.Lock(pkg.String())
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// skip installation if the package has been installed by another request
+	if utils.ParseJSONFile(packageJsonPath, &raw) == nil {
+		packageJson = raw.ToNpmPackage()
+		return
+	}
+
+	if pkg.Github {
+		err = ghInstallContext(ctx, installDir, pkg.Name, pkg.Version)
+		// ensure 'package.json' file if not exists after installing from github
+		if err == nil && !existsFile(packageJsonPath) {
+			packageData := map[string]any{"name": pkg.Name, "version": pkg.Version}
+			var denoJson *npm.PackageJSON
+			if deonJsonPath := filepath.Join(installDir, "node_modules", pkg.Name, "deno.json"); existsFile(deonJsonPath) {
+				var raw npm.PackageJSONRaw
+				if utils.ParseJSONFile(deonJsonPath, &raw) == nil {
+					denoJson = raw.ToNpmPackage()
+				}
+			} else if deonJsoncPath := filepath.Join(installDir, "node_modules", pkg.Name, "deno.jsonc"); existsFile(deonJsoncPath) {
+				data, err := os.ReadFile(deonJsoncPath)
+				if err == nil {
+					var raw npm.PackageJSONRaw
+					if json.Unmarshal(stripJSONC(data), &raw) == nil {
+						denoJson = raw.ToNpmPackage()
+					}
+				}
+			}
+			if denoJson != nil {
+				for field, object := range map[string]npm.JSONObject{"imports": denoJson.Imports, "exports": denoJson.Exports} {
+					values := map[string]string{}
+					for key, value := range object.Values() {
+						if s, ok := value.(string); ok {
+							values[key] = s
+						}
+					}
+					if len(values) > 0 {
+						packageData[field] = values
+					}
+				}
+			}
+			data, encodeErr := json.Marshal(packageData)
+			if encodeErr != nil {
+				return nil, encodeErr
+			}
+			err = os.WriteFile(packageJsonPath, data, 0644)
+			if err != nil {
+				return
+			}
+		}
+	} else if pkg.PkgPrNew {
+		err = fetchPackageTarballContext(ctx, &NpmRegistry{}, installDir, pkg.Name, "https://pkg.pr.new/"+pkg.Name+"@"+pkg.Version)
+	} else {
+		info, fetchErr := npmrc.getPackageInfoContext(ctx, pkg.Name, pkg.Version)
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
+		if info.Deprecated != "" {
+			os.WriteFile(filepath.Join(installDir, "deprecated.txt"), []byte(info.Deprecated), 0644)
+		}
+		err = fetchPackageTarballContext(ctx, npmrc.getRegistryByPackageName(pkg.Name), installDir, info.Name, info.Dist.Tarball)
+	}
+	if err != nil {
+		return
+	}
+
+	err = utils.ParseJSONFile(packageJsonPath, &raw)
+	if err != nil {
+		os.RemoveAll(installDir)
+		err = fmt.Errorf("failed to install %s: %v", pkg.String(), err)
+		return
+	}
+
+	packageJson = raw.ToNpmPackage()
+	return
+}
+
+func (npmrc *NpmRC) installDependencies(wd string, pkgJson *npm.PackageJSON, npmMode bool, mark *set.Set[string]) error {
+	return npmrc.installDependenciesContext(context.Background(), wd, pkgJson, npmMode, mark)
+}
+
+func (npmrc *NpmRC) installDependenciesContext(ctx context.Context, wd string, pkgJson *npm.PackageJSON, npmMode bool, mark *set.Set[string]) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	wg := sync.WaitGroup{}
+	var errMu sync.Mutex
+	var firstErr error
+	dependencies := map[string]string{}
+	maps.Copy(dependencies, pkgJson.Dependencies)
+	// install peer dependencies if `npmMode` is true
+	if npmMode {
+		maps.Copy(dependencies, pkgJson.PeerDependencies)
+	}
+	if mark == nil {
+		mark = set.New[string]()
+	}
+	setErr := func(err error) {
+		if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		errMu.Unlock()
+	}
+	getFirstErr := func() error {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return firstErr
+	}
+	for name, version := range dependencies {
+		if ctx.Err() != nil || getFirstErr() != nil {
+			break
+		}
+		wg.Add(1)
+		go func(name, version string) {
+			defer wg.Done()
+			if ctx.Err() != nil {
+				return
+			}
+			// name is the symlink path below, not necessarily the resolved package.
+			if !npm.ValidatePackageName(name) {
+				return
+			}
+			pkg := npm.Package{Name: name, Version: version}
+			p, err := npm.ResolveDependencyVersion(version)
+			if err != nil || p.Url != "" {
+				setErr(err)
+				return
+			}
+			if p.Name != "" {
+				pkg = p
+			}
+			if strings.HasPrefix(pkg.Name, "@types/") {
+				// skip installing `@types/*` packages
+				return
+			}
+			if !npm.IsExactVersion(pkg.Version) && !pkg.Github && !pkg.PkgPrNew {
+				p, e := npmrc.getPackageInfoContext(ctx, pkg.Name, pkg.Version)
+				if e != nil {
+					setErr(e)
+					return
+				}
+				pkg.Version = p.Version
+			}
+			markId := fmt.Sprintf("%s@%s:%s:%v", pkgJson.Name, pkgJson.Version, pkg.String(), npmMode)
+			if mark.Has(markId) {
+				return
+			}
+			mark.Add(markId)
+			installed, err := npmrc.installPackageContext(ctx, pkg)
+			if err != nil {
+				setErr(err)
+				return
+			}
+			// link the installed package to the node_modules directory of current build context
+			linkDir := filepath.Join(wd, "node_modules", name)
+			_, err = os.Lstat(linkDir)
+			if err != nil && os.IsNotExist(err) {
+				if strings.ContainsRune(name, '/') {
+					ensureDir(filepath.Dir(linkDir))
+				}
+				err = os.Symlink(filepath.Join(npmrc.StoreDir(), pkg.String(), "node_modules", pkg.Name), linkDir)
+				if err != nil && !os.IsExist(err) {
+					setErr(err)
+					return
+				}
+			} else if err != nil {
+				setErr(err)
+				return
+			}
+			// install dependencies recursively
+			if len(installed.Dependencies) > 0 || (len(installed.PeerDependencies) > 0 && npmMode) {
+				if err := npmrc.installDependenciesContext(ctx, wd, installed, npmMode, mark); err != nil {
+					setErr(err)
+				}
+			}
+		}(name, version)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// If the package is deprecated, a depreacted.txt file will be created by the `intallPackage` function
+func (npmrc *NpmRC) isDeprecated(pkgName string, pkgVersion string) (string, error) {
+	installDir := filepath.Join(npmrc.StoreDir(), pkgName+"@"+pkgVersion)
+	data, err := os.ReadFile(filepath.Join(installDir, "deprecated.txt"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return string(data), nil
+}
+
+func (reg *NpmRegistry) isRateLimited() bool {
+	return reg.rateLimited.Load() == 1
+}
+
+func (reg *NpmRegistry) hitRateLimit() {
+	reg.rateLimited.Store(1)
+	time.AfterFunc(30*time.Second, func() {
+		reg.rateLimited.Store(0)
+	})
+}
+
+// check if the registry supports the version route
+// example: https://registry.npmjs.org/react/19.0.0
+func (reg *NpmRegistry) isSupportVersionRoute(urlStr string) bool {
+	if strings.HasPrefix(urlStr, npmRegistry) {
+		return true
+	}
+
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return false
+	}
+
+	if reg.versionRouteSupported.Load() == 1 {
+		return true
+	}
+
+	fetchClient := newFetchClient("esmd/"+VERSION, 15)
+
+	u.Path = "/react/19.0.0"
+	res, err := fetchClient.Fetch(u, nil)
+	if err != nil {
+		return false
+	}
+
+	defer res.Body.Close()
+	if res.StatusCode == 200 {
+		reg.versionRouteSupported.Store(1)
+		return true
+	}
+	return false
+}
+
+func sameURLOrigin(a *url.URL, b *url.URL) bool {
+	if !strings.EqualFold(a.Scheme, b.Scheme) || !strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return false
+	}
+	aPort, bPort := a.Port(), b.Port()
+	if aPort == bPort {
+		return true
+	}
+	if strings.EqualFold(a.Scheme, "http") {
+		return aPort == "" && bPort == "80" || aPort == "80" && bPort == ""
+	}
+	return strings.EqualFold(a.Scheme, "https") && (aPort == "" && bPort == "443" || aPort == "443" && bPort == "")
+}
+
+func fetchPackageTarballContext(ctx context.Context, reg *NpmRegistry, installDir string, pkgName string, tarballUrlStr string) (err error) {
+	tarballUrl, err := url.Parse(tarballUrlStr)
+	if err != nil {
+		return
+	}
+	registryUrls := make([]*url.URL, 0, 2)
+	for _, urlStr := range [...]string{reg.Registry, reg.BackupRegistry} {
+		if urlStr != "" {
+			if u, parseErr := url.Parse(urlStr); parseErr == nil {
+				registryUrls = append(registryUrls, u)
+			}
+		}
+	}
+	isTrustedOrigin := func(u *url.URL) bool {
+		for _, registryUrl := range registryUrls {
+			if sameURLOrigin(u, registryUrl) {
+				return true
+			}
+		}
+		return false
+	}
+
+	useBackup := reg.isRateLimited() && reg.BackupRegistry != "" && strings.HasPrefix(tarballUrlStr, reg.Registry)
+	if useBackup {
+		var backupUrl *url.URL
+		backupUrl, err = url.Parse(reg.BackupRegistry)
+		if err != nil {
+			return
+		}
+		backupUrl.Path = tarballUrl.Path
+		backupUrl.RawQuery = tarballUrl.RawQuery
+		tarballUrl = backupUrl
+		tarballUrlStr = backupUrl.String()
+	}
+
+	header := http.Header{}
+	if isTrustedOrigin(tarballUrl) {
+		if reg.Token != "" {
+			header.Set("Authorization", "Bearer "+reg.Token)
+		} else if reg.User != "" && reg.Password != "" {
+			header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(reg.User+":"+reg.Password)))
+		}
+	}
+
+	fetchClient := newFetchClient("esmd/"+VERSION, 30)
+	checkRedirect := fetchClient.CheckRedirect
+	fetchClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if !isTrustedOrigin(req.URL) {
+			req.Header.Del("Authorization")
+		}
+		return checkRedirect(req, via)
+	}
+
+	retryTimes := 0
+RETRY:
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	res, err := fetchClient.FetchWithContext(ctx, tarballUrl, header)
+	if err != nil {
+		if retryTimes < 3 {
+			retryTimes++
+			if sleepErr := sleepWithContext(ctx, time.Duration(retryTimes)*100*time.Millisecond); sleepErr != nil {
+				return sleepErr
+			}
+			goto RETRY
+		}
+		err = fmt.Errorf("failed to download tarball of package '%s': %v", pkgName, err)
+		return
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode == 404 || res.StatusCode == 401 {
+		err = fmt.Errorf("tarball of package '%s' not found", pkgName)
+		return
+	}
+
+	if res.StatusCode == 429 && !useBackup && reg.BackupRegistry != "" && strings.HasPrefix(tarballUrlStr, reg.Registry) {
+		var backupUrl *url.URL
+		backupUrl, err = url.Parse(reg.BackupRegistry)
+		if err != nil {
+			return
+		}
+		backupUrl.Path = tarballUrl.Path
+		backupUrl.RawQuery = tarballUrl.RawQuery
+		tarballUrl = backupUrl
+		tarballUrlStr = backupUrl.String()
+		useBackup = true
+		reg.hitRateLimit()
+		goto RETRY
+	}
+
+	if res.StatusCode != 200 {
+		err = fmt.Errorf("could not download tarball of package '%s': %s", pkgName, res.Status)
+		return
+	}
+
+	err = extractPackageTarballContext(ctx, installDir, pkgName, io.LimitReader(res.Body, maxPackageTarballSize))
+	if err != nil {
+		err = fmt.Errorf("failed to extract tarball of package '%s': %v", pkgName, err)
+		// clear installDir if failed to extract tarball
+		os.RemoveAll(installDir)
+	}
+	return
+}
+
+func extractPackageTarball(installDir string, pkgName string, tarball io.Reader) (err error) {
+	return extractPackageTarballContext(context.Background(), installDir, pkgName, tarball)
+}
+
+func extractPackageTarballContext(ctx context.Context, installDir string, pkgName string, tarball io.Reader) (err error) {
+	unziped, err := gzip.NewReader(&contextReader{ctx: ctx, reader: tarball})
+	if err != nil {
+		return
+	}
+	defer unziped.Close()
+	return extractPackageTarContext(ctx, installDir, pkgName, unziped)
+}
+
+func extractPackageTarContext(ctx context.Context, installDir string, pkgName string, archive io.Reader) (err error) {
+	// pkgName is joined into the extraction path below.
+	if !filepath.IsLocal(pkgName) {
+		return errors.New("invalid package name: " + pkgName)
+	}
+
+	// Confine every write to installDir, including when a symlink is already at
+	// the destination. Lexical path checks alone cannot provide that guarantee.
+	if err = ensureDir(installDir); err != nil {
+		return
+	}
+	root, err := os.OpenRoot(installDir)
+	if err != nil {
+		return
+	}
+	defer root.Close()
+
+	// extract tarball
+	tr := tar.NewReader(&contextReader{ctx: ctx, reader: archive})
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if h.Typeflag != tar.TypeReg {
+			continue
+		}
+		// ignore large files
+		if h.Size > maxAssetFileSize {
+			continue
+		}
+		// normalize the filename
+		_, filename := utils.SplitByFirstByte(utils.NormalizePathname(h.Name)[1:], '/')
+		if filename == "" {
+			continue
+		}
+		savepath := filepath.Join("node_modules", pkgName, filename)
+		extname := filepath.Ext(savepath)
+		if !(extname != "" && (assetExts[extname[1:]] || slices.Contains(moduleExts, extname) || extname == ".map" || extname == ".css" || extname == ".svelte" || extname == ".vue")) {
+			// ignore unsupported formats
+			continue
+		}
+		if err := root.MkdirAll(filepath.Dir(savepath), 0755); err != nil {
+			return err
+		}
+		f, err := root.OpenFile(savepath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+		if err != nil {
+			return err
+		}
+		n, err := io.Copy(f, &contextReader{ctx: ctx, reader: tr})
+		closeErr := f.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if n != h.Size {
+			return errors.New("extractPackageTarball: incomplete file: " + savepath)
+		}
+	}
+
+	return nil
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := r.reader.Read(p)
+	if err == nil {
+		if ctxErr := r.ctx.Err(); ctxErr != nil {
+			return n, ctxErr
+		}
+	}
+	return n, err
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}

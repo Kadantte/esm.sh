@@ -7,60 +7,12 @@ if [ "$host" == "--init" ]; then
   host="$2"
 fi
 
-port="80"
-tlsPort="0"
-workDir="/etc/esmd"
-cacheUrl=""
-fsUrl=""
-dbUrl=""
-origin=""
-npmRegistry=""
-npmToken=""
-authSecret=""
-
+config=""
 if [ "$init" == "yes" ]; then
-  echo "Server options:"
-  read -p "? http server port (default is ${port}): " v
+  read -p "? server configuration (JSON): " v
   if [ "$v" != "" ]; then
-    port="$v"
+    config="$v"
   fi
-  read -p "? https(autocert) server port (default is disabled): " v
-  if [ "$v" != "" ]; then
-    tlsPort="$v"
-  fi
-  read -p "? workDir (ensure you have the r/w permission of it, default is '${workDir}'): " v
-  if [ "$v" != "" ]; then
-    workDir="$v"
-  fi
-  read -p "? cache (default is 'memory:main'): " v
-  if [ "$v" != "" ]; then
-    cacheUrl="$v"
-  fi
-  read -p "? file storage (default is 'local:\$workDir/storage'): " v
-  if [ "$v" != "" ]; then
-    fsUrl="$v"
-  fi
-  read -p "? database (default is 'postdb:\$workDir/esm.db'): " v
-  if [ "$v" != "" ]; then
-    dbUrl="$v"
-  fi
-  read -p "? server origin (optional): " v
-  if [ "$v" != "" ]; then
-    origin="$v"
-  fi
-  read -p "? npm registry (optional): " v
-  if [ "$v" != "" ]; then
-    npmRegistry="$v"
-  fi
-  read -p "? private token for npm registry (optional): " v
-  if [ "$v" != "" ]; then
-    npmToken="$v"
-  fi
-  read -p "? auth secret (optional): " v
-  if [ "$v" != "" ]; then
-    authSecret="$v"
-  fi
-  echo "---"
 fi
 
 if [ "$host" == "" ]; then
@@ -75,8 +27,17 @@ if [ "$host" == "" ]; then
   exit
 fi
 
+read -p "? host os (default is \"linux\"): " goos
+read -p "? host architecture (default is \"amd64\"): " goarch
+if [ "$goos" == "" ]; then
+  goos="linux"
+fi
+if [ "$goarch" == "" ]; then
+  goarch="amd64"
+fi
+
 user="root"
-read -p "? login user (default is 'root'): " v
+read -p "? login user (default is \"root\"): " v
 if [ "$v" != "" ]; then
   user="$v"
 fi
@@ -87,17 +48,17 @@ if [ "$v" != "" ]; then
   sshPort="$v"
 fi
 
-cd $(dirname $0)
-sh build.sh
-
+echo "--- building(${goos}_$goarch)..."
+export GOOS=$goos
+export GOARCH=$goarch
+go build -ldflags="-s -w" -o esmd $(dirname $0)/../server/esmd/main.go
 if [ "$?" != "0" ]; then
   exit
 fi
-
-echo "--- compressing..."
-tar -czf esmd.tar.gz esmd
+du -h esmd
 
 echo "--- uploading..."
+tar -czf esmd.tar.gz esmd
 scp -P $sshPort esmd.tar.gz $user@$host:/tmp/esmd.tar.gz
 if [ "$?" != "0" ]; then
   rm -f esmd
@@ -106,44 +67,74 @@ if [ "$?" != "0" ]; then
 fi
 
 echo "--- installing..."
-ssh -p $sshPort $user@$host << EOF
-  SVVer=\$(supervisorctl version)
-  if [ "\$?" != "0" ]; then
-    echo "error: missing supervisor!"
-    exit
-  fi
-  echo "supervisor \$SVVer"
-
-  SVCF=/etc/supervisor/conf.d/esmd.conf
-  writeSVConfLine () {
-    echo "\$1" >> \$SVCF
-  }
-
+ssh -p $sshPort ${user}@${host} << EOF
   cd /tmp
+  rm -f esmd
   tar -xzf esmd.tar.gz
+  chmod +x esmd
+  if [ "\$?" != "0" ]; then
+    exit 1
+  fi
+  rm -f esmd.tar.gz
 
-  supervisorctl stop esmd
-  rm -f /usr/local/bin/esmd
-  mv -f esmd /usr/local/bin/esmd
-  chmod +x /usr/local/bin/esmd
+  git version
+  if [ "\$?" == "127" ]; then
+    apt-get update
+    apt-get install -y git
+  fi
+
+  configjson=/etc/esmd/config.json
+  servicerc=/etc/systemd/system/esmd.service
+  cronrc=/etc/cron.monthly/esmd
 
   if [ "$init" == "yes" ]; then
-    echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf && sudo sysctl -p
-    if [ -f \$SVCF ]; then
-      rm -f \$SVCF
+    addgroup esm
+    adduser --ingroup esm --home=/esm --disabled-login --disabled-password --gecos "" esm
+    rm -f \$servicerc
+    rm -f \$cronrc
+    echo "[Unit]" >> \$servicerc
+    echo "Description=esm.sh service" >> \$servicerc
+    echo "After=network.target" >> \$servicerc
+    echo "StartLimitIntervalSec=0" >> \$servicerc
+    echo "[Service]" >> \$servicerc
+    echo "Type=simple" >> \$servicerc
+    if [ "$config" != "" ]; then
+      rm -f \$configjson
+      mkdir -p /etc/esmd
+      echo '$config' >> \$configjson
+      echo "ExecStart=/usr/local/bin/esmd --config=\$configjson" >> \$servicerc
+    else
+      echo "ExecStart=/usr/local/bin/esmd" >> \$servicerc
     fi
-    mkdir -p /etc/esmd
-    echo "{\"port\":${port},\"tlsPort\":${tlsPort},\"workDir\":\"${workDir}\",\"cache\":\"${cacheUrl}\",\"storage\":\"${fsUrl}\",\"database\":\"${dbUrl}\",\"origin\":\"${origin}\",\"npmRegistry\":\"${npmRegistry}\",\"npmToken\":\"${npmToken}\",\"authSecret\":\"${authSecret}\"}" >> /etc/esmd/config.json
-    writeSVConfLine "[program:esmd]"
-    writeSVConfLine "command=/usr/local/bin/esmd --config=/etc/esmd/config.json"
-    writeSVConfLine "directory=/tmp"
-    writeSVConfLine "user=$user"
-    writeSVConfLine "autostart=true"
-    writeSVConfLine "autorestart=true"
-    supervisorctl reload
+    echo "WorkingDirectory=/esm" >> \$servicerc
+    echo "Group=esm" >> \$servicerc
+    echo "User=esm" >> \$servicerc
+    echo "AmbientCapabilities=CAP_NET_BIND_SERVICE" >> \$servicerc
+    echo "Restart=always" >> \$servicerc
+    echo "RestartSec=5" >> \$servicerc
+    echo "Environment=\"ESMDIR=/esm\"" >> \$servicerc
+    echo "[Install]" >> \$servicerc
+    echo "WantedBy=multi-user.target" >> \$servicerc
+    echo "#!/bin/bash" >> \$cronrc
+    echo "# purge npm cache" >> \$cronrc
+    echo "mv /esm/npm /tmp/_npm" >> \$cronrc
+    echo "rm -rf /tmp/_npm" >> \$cronrc
+    chmod +x \$cronrc
   else
-    supervisorctl start esmd
+    systemctl stop esmd.service
+    echo "Stopped esmd.service."
   fi
+
+  mv -f esmd /usr/local/bin/esmd
+
+  if [ "$init" == "yes" ]; then
+    systemctl daemon-reload
+    systemctl enable esmd.service
+    systemctl restart cron.service
+  fi
+
+  systemctl start esmd.service
+  echo "Started esmd.service."
 EOF
 
 rm -f esmd

@@ -1,0 +1,69 @@
+# esm.sh
+
+A _no-build_ JavaScript CDN for modern web development.
+
+## Project Structure
+
+- `cli/`: Command-line interface (releases as the npm `esm.sh` CLI).
+- `internal/`: Go packages for import maps, NPM resolution, storage, and module replacements.
+- `server/`: Main HTTP service: request handling, bundling, and CDN behavior.
+- `test/`: Deno-based integration suites; each subdirectory exercises imports against a running server (`test/.template` is the scaffold for new cases).
+
+## Running the Server in Debug Mode
+
+```bash
+make run/server
+```
+
+Then you can import modules from `http://localhost:8080/<package>[@<version>][/<path>][?<query>]` in browser/Deno.
+
+More usage examples can be found in the [README](./README.md).
+
+## Running Server Integration Tests
+
+We use [Deno](https://deno.land) to run all the integration testing cases. Make sure you have Deno installed on your computer.
+
+```bash
+# Run all tests
+make test/server
+
+# Run a specific test
+make test/server dir=react-18
+```
+
+To add a new integration test case, copy the [test/.template](./test/.template) directory and rename it to your case name.
+
+```bash
+# copy the testing template
+cp -r test/.template test/test-case-name
+# edit the test code
+vi test/test-case-name/test.ts
+# run the test
+make test/server dir=test-case-name
+```
+
+## Running Server Unit Tests
+
+```bash
+go test ./server/...
+```
+
+On Windows the `server` package does not compile natively because `server/disk.go` uses the unix-only
+`syscall.Statfs`. To run the unit tests there, swap that file for a stub with `go test -overlay` (no repo
+change needed):
+
+```powershell
+# stub with the same exported symbols as disk.go (see server/disk.go)
+go test -overlay="$tmp\overlay.json" ./server/...
+```
+
+where `overlay.json` maps the absolute `server/disk.go` path to a stub that returns `DiskStatusOk`. Note that
+a few tests are still platform/network bound and fail on Windows (`TestInstallCjsModuleLexerRetry` reports
+`unsupported os`, `TestGhInstall` needs GitHub access).
+
+## CDN
+
+The project has been deployed to https://esm.sh.
+
+- https://esm.sh/status.json: CDN status.
+- https://esm.sh/<package>[@<version>][/<path>][?<query>]: CDN URL for the package.

@@ -1,38 +1,86 @@
 {
-  // The port to listen server on for HTTP, default is 8080.
-  "port": 8080,
+  // The port to listen server on for HTTP requests, default is 80.
+  "port": 80,
 
-  // The port to listen server on for HTTPs, default is 0 (disabled). Change to 443 if you want to enable it.
-  // You don't need to provide a certificate, it will generate automatically by autocert.
-  // Note: Docker users needs to provide tls certificate.
+  // The port to listen server on for HTTPs requests, default is 0 (disabled). Change to 443 if you want to enable it.
+  // You don't need to provide a certificate, the server uses ACME protocol to get a free certificate from Let's Encrypt.
+  // Note: if you are running the server in a docker container, you need to expose port `443:443`.
   "tlsPort": 0,
 
-  // The secret token to validate the `Authorization: Bearer <secret>` header of requests, default is disabled.
-  "authSecret": "",
+  // The public CDN origin, default is empty (use `http.Request.Host` as the origin).
+  // Required when `tlsPort` is enabled; automatic certificates are restricted to this hostname.
+  "cdnOrigin": "",
 
-  // The build max concurrency, default is `runtime.NumCPU()`
+  // Allowed CORS origins, default is allow all origins.
+  // Note: A valid origin must be a valid URL, including the protocol, domain, and port. e.g. "https://example.com".
+  "corsAllowOrigins": [],
+
+  // Proxy CIDRs allowed to supply X-Forwarded-For or X-Real-IP for client IPs.
+  // Empty by default. For a local reverse proxy, use ["127.0.0.1/32", "::1/128"].
+  "trustedProxies": [],
+
+  // Maximum number of concurrent build process, default equals to the number of CPU cores.
   "buildConcurrency": 0,
 
-  // The max waiting time for the build to complete, default is 30 seconds.
-  "buildTimeout": 30,
+  // The wait time for incoming requests to wait for the build process to finish, default is 30 seconds.
+  "buildWaitTime": 30,
 
-  // The work directory for the server app, default is "~/.esmd".
+  // Maximum time allowed for a single build task before it is canceled, default is 10 minutes.
+  "buildTimeout": 600,
+
+  // Compress http response body with gzip/brotli, default is true.
+  "compress": true,
+
+  // Minify built js/css files, default is true,
+  "minify": true,
+
+  // Generate source map for built js/css files, default is true.
+  "sourceMap": true,
+
+  // The storage option.
+  // Examples:
+  // - Use local file system as the storage:
+  //   "storage": {
+  //     "type": "fs",
+  //     "endpoint": "/path/to/storage"
+  //   }
+  // - Use S3-compatible storage:
+  //   "storage": {
+  //     "type": "s3",
+  //     "endpoint": "https://bucket.s3.amazonaws.com",
+  //     "region": "us-west-1",
+  //     "accessKeyID": "***",
+  //     "secretAccessKey": "***"
+  //   }
+  "storage": {
+    // storage type, supported types are ["fs", "s3"], default is "fs".
+    "type": "fs",
+    // storage endpoint, default is "~/.esmd/storage".
+    "endpoint": "~/.esmd/storage",
+    // s3 storage region.
+    "region": "",
+    // s3 storage access key id.
+    "accessKeyID": "",
+    // s3 storage secret access key.
+    "secretAccessKey": "",
+    // cache files on local file system for s3 storage, default is disabled.
+    "cacheDir": ""
+  },
+
+  // The custom landing page options, default is empty.
+  // The server will proxy the `/` request to the `origin` server if it's provided.
+  // If your custom landing page has own assets, you also need to provide those asset paths in the `assets` field.
+  "customLandingPage":  {
+    "origin": "https://example.com",
+    "assets": [
+      "/favicon.ico",
+      "/assets/app.js",
+      "/assets/app.css"
+    ]
+  },
+
+  // The work directory for the build system, default is "~/.esmd".
   "workDir": "~/.esmd",
-
-  // The cache source, default is "memory:default".
-  // You can also implement your own cache by implementing the `Cache` interface
-  // in https://github.com/esm-dev/esm.sh/blob/main/server/storage/cache.go
-  "cache": "memory:default",
-
-  // The database source, default is "bolt:~/.esmd/esm.db".
-  // You can also implement your own database by implementing the `DataBase` interface
-  // in https://github.com/esm-dev/esm.sh/blob/main/server/storage/db.go
-  "database": "bolt:~/.esmd/esm.db",
-
-  // The file storage source, default is "local:~/.esmd/storage".
-  // You can also implement your own file storage by implementing the `FileSystem` interface
-  // in https://github.com/esm-dev/esm.sh/blob/main/server/storage/fs.go
-  "storage": "local:~/.esmd/storage",
 
   // The log directory, default is "~/.esmd/log".
   "logDir": "~/.esmd/log",
@@ -40,8 +88,35 @@
   // The log level, available values are ["debug", "info", "warn", "error"], default is "info".
   "logLevel": "info",
 
+  // Enable access log, default is disabled.
+  // The access log will be written to the log directory with the name "access-<date>.log".
+  "accessLog": false,
+
+  // The cache TTL for npm packages query, default is 600 seconds (10 minutes).
+  "npmQueryCacheTTL": 600,
+
+  // Cache purge API configuration.
+  "purgeAPI": {
+    // Enable cache purging (`POST /purge`), default is true.
+    // Can also be disabled with the `PURGE_CACHE=false` environment variable.
+    "enable": true,
+
+    // Require GitHub sign-in when both credentials are set. Proof-of-work is still required.
+    // Can also be provided with `PURGE_GITHUB_CLIENT_ID` / `PURGE_GITHUB_CLIENT_SECRET`.
+    "githubClientId": "",
+    "githubClientSecret": "",
+
+    // Purge Cloudflare package prefixes for exact versions when both credentials are set.
+    // Can also be provided with `PURGE_CLOUDFLARE_ZONE_ID` / `PURGE_CLOUDFLARE_API_TOKEN`.
+    "cloudflareZoneId": "",
+    "cloudflareApiToken": ""
+  },
+
   // The global npm registry, default is "https://registry.npmjs.org/".
   "npmRegistry": "https://registry.npmjs.org/",
+
+  // When the global npm registry is not available, the server will try to use the backup registry to download the package.
+  "npmBackupRegistry": "",
 
   // The npm access token for the global npm registry, default is empty.
   "npmToken": "",
@@ -53,38 +128,27 @@
 
   // Registries for scoped packages. This will ensure packages with these scopes get downloaded
   // from specific registry, default is empty.
-  "npmRegistries": {
+  "npmScopedRegistries": {
     "@scope_name": {
       "registry": "https://your-registry.com/",
-      "token": "xxx",
-      "user": "username",
-      "password": "xxx"
+      "token": "",
+      "user": "",
+      "password": ""
     }
   },
 
-  // Whether to minify the build JS/CSS files, default is true.
-  "minify": true,
+  // The list to only allow some packages or scopes, default allow all.
+  "allowList": {
+    "packages": ["@scope_name/package_name"],
+    "scopes": ["@scope_name"]
+  },
 
-  // Disable http compression, default is false.
-  "disableCompression": false,
-
-  // Disable generating source map for build js files, default is false.
-  "disableSourceMap": false,
-
-  // The list to ban some packages or scopes.
+  // The list to ban some packages or scopes, default no ban.
   "banList": {
     "packages": ["@scope_name/package_name"],
     "scopes": [{
       "name": "@scope_name",
       "excludes": ["package_name"]
-    }]
-  },
-
-  // The list to only allow some packages or scopes.
-  "allowList": {
-    "packages": ["@scope_name/package_name"],
-    "scopes": [{
-      "name": "@scope_name"
     }]
   }
 }

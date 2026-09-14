@@ -1,66 +1,82 @@
 package server
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/ije/gox/set"
 )
 
 func TestEncodeBuildArgs(t *testing.T) {
-	external := NewStringSet()
-	exports := NewStringSet()
 	conditions := []string{"react-server"}
-	external.Add("baz")
-	external.Add("bar")
-	exports.Add("baz")
-	exports.Add("bar")
 	buildArgsString := encodeBuildArgs(
 		BuildArgs{
-			alias: map[string]string{"a": "b"},
-			deps: map[string]string{
-				"c":   "1.0.0",
-				"d":   "1.0.0",
-				"e":   "1.0.0",
-				"foo": "1.0.0", // to be ignored
+			Alias: map[string]string{"a": "b"},
+			Deps: map[string]string{
+				"c": "1.0.0",
+				"d": "1.0.0",
+				"e": "1.0.0",
 			},
-			external:          external,
-			exports:           exports,
-			conditions:        conditions,
-			jsxRuntime:        &Pkg{Version: "18.2.0", Name: "react"},
-			externalRequire:   true,
-			keepNames:         true,
-			ignoreAnnotations: true,
+			External:          *set.NewReadOnly("baz", "bar"),
+			Conditions:        conditions,
+			ExternalRequire:   true,
+			KeepNames:         true,
+			IgnoreAnnotations: true,
 		},
-		Pkg{Name: "foo"},
 		false,
 	)
-	args, err := decodeBuildArgs(nil, buildArgsString)
+	args, err := decodeBuildArgs(buildArgsString)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(args.alias) != 1 || args.alias["a"] != "b" {
+	if len(args.Alias) != 1 || args.Alias["a"] != "b" {
 		t.Fatal("invalid alias")
 	}
-	if len(args.deps) != 3 {
+	if len(args.Deps) != 3 {
 		t.Fatal("invalid deps")
 	}
-	if args.external.Len() != 2 {
+	if args.External.Len() != 2 {
 		t.Fatal("invalid external")
 	}
-	if args.exports.Len() != 2 {
-		t.Fatal("invalid exports")
-	}
-	if len(args.conditions) != 1 || args.conditions[0] != "react-server" {
+	if len(args.Conditions) != 1 || args.Conditions[0] != "react-server" {
 		t.Fatal("invalid conditions")
 	}
-	if args.jsxRuntime.String() != "react@18.2.0" {
-		t.Fatal("invalid jsxRuntime")
-	}
-	if !args.externalRequire {
+	if !args.ExternalRequire {
 		t.Fatal("ignoreRequire should be true")
 	}
-	if !args.keepNames {
+	if !args.KeepNames {
 		t.Fatal("keepNames should be true")
 	}
-	if !args.ignoreAnnotations {
+	if !args.IgnoreAnnotations {
 		t.Fatal("ignoreAnnotations should be true")
+	}
+}
+
+func TestResolveBuildArgsExternalWithoutWalkingDeps(t *testing.T) {
+	wd := t.TempDir()
+	for name, contents := range map[string]string{
+		"example": `{"name":"example","dependencies":{"broken":"1.0.0"}}`,
+		"broken":  `invalid package metadata`,
+	} {
+		pkgDir := filepath.Join(wd, "node_modules", name)
+		if err := os.MkdirAll(pkgDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(pkgDir, "package.json"), []byte(contents), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, external := range []string{"node:fs", "example"} {
+		t.Run(external, func(t *testing.T) {
+			args := BuildArgs{External: *set.NewReadOnly(external)}
+			err := resolveBuildArgs(nil, wd, &args, EsmPath{PkgName: "example", PkgVersion: "1.0.0", SubPath: "sub"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !args.External.Has(external) {
+				t.Fatalf("lost external %q", external)
+			}
+		})
 	}
 }

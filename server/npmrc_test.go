@@ -1,0 +1,480 @@
+package server
+
+import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/esm-dev/esm.sh/internal/npm"
+)
+
+func TestResolveSemverVersion(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		version string
+		tags    map[string]string
+		want    string
+	}{
+		{"missing latest", "latest", nil, ""},
+		{"unknown tag without latest", "unknown", nil, ""},
+		{"dangling latest", "latest", map[string]string{"latest": "3.0.0"}, ""},
+		{"latest", "latest", map[string]string{"latest": "1.2.0"}, "1.2.0"},
+		{"unknown tag falls back to latest", "unknown", map[string]string{"latest": "1.2.0"}, "1.2.0"},
+		{"named tag", "next", map[string]string{"next": "2.0.0-beta.1"}, "2.0.0-beta.1"},
+		{"highest matching version", "^1", nil, "1.10.0"},
+		{"stable wildcard", "*", nil, "1.10.0"},
+		{"no matching version", "^3", nil, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			metadata := &npm.PackageMetadata{
+				DistTags: test.tags,
+				Versions: map[string]npm.PackageJSONRaw{
+					"1.2.0":        {Version: "1.2.0"},
+					"1.10.0":       {Version: "1.10.0"},
+					"2.0.0-beta.1": {Version: "2.0.0-beta.1"},
+				},
+			}
+			got, err := resolveSemverVersion(metadata, test.version)
+			if got != test.want || (err != nil) != (test.want == "") {
+				t.Fatalf("resolveSemverVersion(%q) = %q, %v; want %q", test.version, got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestResolveSemverOriginalVersion(t *testing.T) {
+	metadata := &npm.PackageMetadata{Versions: map[string]npm.PackageJSONRaw{
+		"v1.2.0": {Version: "v1.2.0"},
+	}}
+	got, err := resolveSemverVersion(metadata, "^1")
+	if err != nil || got != "v1.2.0" {
+		t.Fatalf("resolved version = %q, %v; want the original metadata key", got, err)
+	}
+}
+
+func BenchmarkResolveSemverVersion(b *testing.B) {
+	for _, count := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			metadata := &npm.PackageMetadata{Versions: make(map[string]npm.PackageJSONRaw, count)}
+			for i := range count {
+				version := fmt.Sprintf("1.%d.0", i)
+				metadata.Versions[version] = npm.PackageJSONRaw{Version: version}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if _, err := resolveSemverVersion(metadata, "^1"); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestInstallDependenciesSkipsTypes(t *testing.T) {
+	transport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = transport })
+	http.DefaultTransport = ghTestTransport(func(r *http.Request) (*http.Response, error) {
+		t.Errorf("unexpected request for a types-only dependency: %s", r.URL)
+		return &http.Response{StatusCode: http.StatusNotFound, Body: http.NoBody}, nil
+	})
+	npmrc := &NpmRC{globalRegistry: &NpmRegistry{NpmRegistryConfig: NpmRegistryConfig{Registry: npmRegistry}}}
+	err := npmrc.installDependencies(t.TempDir(), &npm.PackageJSON{
+		Name: "test", Version: "1.0.0",
+		Dependencies: map[string]string{"@types/test": "1.0.0", "types-alias": "npm:@types/test@1.0.0"},
+	}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInstallGithubDenoConfig(t *testing.T) {
+	workDir, transport := config.WorkDir, http.DefaultTransport
+	config.WorkDir = t.TempDir()
+	t.Cleanup(func() { config.WorkDir, http.DefaultTransport = workDir, transport })
+	for _, test := range []struct {
+		name, filename, content string
+	}{
+		{"escaped strings", "deno.json", `{"imports":{"quote\"name":"./quote\"file.ts"},"exports":{".":"./a\\b.ts"}}`},
+		{"non-string entries", "deno.json", `{"imports":{"ignored":{"default":"./index.ts"}},"exports":{".":{"default":"./index.ts"}}}`},
+		{"comments", "deno.jsonc", "{\n// comment\n\"exports\":{\".\":\"./index.ts\"}}"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var archive bytes.Buffer
+			gz := gzip.NewWriter(&archive)
+			tw := tar.NewWriter(gz)
+			if err := tw.WriteHeader(&tar.Header{Name: "repo/" + test.filename, Mode: 0644, Size: int64(len(test.content))}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(tw, test.content); err != nil {
+				t.Fatal(err)
+			}
+			if err := tw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := gz.Close(); err != nil {
+				t.Fatal(err)
+			}
+			http.DefaultTransport = ghTestTransport(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(archive.Bytes()))}, nil
+			})
+			pkg := npm.Package{Github: true, Name: "owner/" + strings.ReplaceAll(test.name, " ", "-"), Version: "abcdef0"}
+			info, err := new(NpmRC).installPackage(pkg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Name != pkg.Name || info.Version != pkg.Version {
+				t.Fatalf("incorrect generated package identity: %s@%s", info.Name, info.Version)
+			}
+			switch test.name {
+			case "escaped strings":
+				if got, _ := info.Imports.Get(`quote"name`); got != `./quote"file.ts` {
+					t.Fatalf("import = %q", got)
+				}
+				if got, _ := info.Exports.Get("."); got != `./a\b.ts` {
+					t.Fatalf("export = %q", got)
+				}
+			case "non-string entries":
+				if info.Imports.Len() != 0 || info.Exports.Len() != 0 {
+					t.Fatal("non-string entries should be omitted")
+				}
+			case "comments":
+				if got, _ := info.Exports.Get("."); got != "./index.ts" {
+					t.Fatalf("export = %q", got)
+				}
+			}
+		})
+	}
+}
+
+func TestInvalidateDistTagCacheIfNewer(t *testing.T) {
+	tests := []struct {
+		request string
+		invalid bool
+	}{
+		{"1.2.0", false},  // equal to the cached `latest`
+		{"1.1.0", false},  // older
+		{"2.0.0", true},   // newer
+		{"latest", false}, // non-exact
+		{"v2.0.0", true},  // v-prefixed newer
+	}
+	for _, test := range tests {
+		setCacheItem("npm:cache-test@latest", &npm.PackageJSON{Version: "1.2.0"}, time.Minute)
+		setCacheItem("404:cache-test@latest", "boom", time.Minute)
+		invalidateDistTagCacheIfNewer("cache-test", test.request)
+		_, ok := getCacheItem("npm:cache-test@latest")
+		if invalid := !ok; invalid != test.invalid {
+			t.Fatalf("request %q: expected invalidated=%v, got %v", test.request, test.invalid, invalid)
+		}
+	}
+}
+
+func TestSameURLOrigin(t *testing.T) {
+	registryUrl, _ := url.Parse("https://registry.example/package")
+	for _, test := range []struct {
+		url  string
+		want bool
+	}{
+		{"https://registry.example/tarball.tgz", true},
+		{"https://REGISTRY.EXAMPLE:443/tarball.tgz", true},
+		{"http://registry.example/tarball.tgz", false},
+		{"https://registry.example:444/tarball.tgz", false},
+		{"https://tarballs.example/tarball.tgz", false},
+	} {
+		tarballUrl, _ := url.Parse(test.url)
+		if got := sameURLOrigin(registryUrl, tarballUrl); got != test.want {
+			t.Errorf("sameURLOrigin(%q, %q) = %v, want %v", registryUrl, tarballUrl, got, test.want)
+		}
+	}
+}
+
+func TestFetchPackageTarballAuthorization(t *testing.T) {
+	var tarball bytes.Buffer
+	gw := gzip.NewWriter(&tarball)
+	tw := tar.NewWriter(gw)
+	content := []byte(`{"name":"test-package","version":"1.0.0"}`)
+	if err := tw.WriteHeader(&tar.Header{Name: "package/package.json", Mode: 0644, Size: int64(len(content))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	authorization := make(chan string, 1)
+	tarballServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization <- r.Header.Get("Authorization")
+		_, _ = w.Write(tarball.Bytes())
+	}))
+	defer tarballServer.Close()
+
+	basicAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("user:password"))
+	for _, test := range []struct {
+		name     string
+		registry NpmRegistryConfig
+		want     string
+	}{
+		{"same-origin bearer token", NpmRegistryConfig{Registry: tarballServer.URL + "/", Token: "secret"}, "Bearer secret"},
+		{"cross-origin bearer token", NpmRegistryConfig{Registry: "https://registry.example/", Token: "secret"}, ""},
+		{"same-origin basic auth", NpmRegistryConfig{Registry: tarballServer.URL + "/", User: "user", Password: "password"}, basicAuth},
+		{"cross-origin basic auth", NpmRegistryConfig{Registry: "https://registry.example/", User: "user", Password: "password"}, ""},
+		{"backup registry", NpmRegistryConfig{Registry: "https://registry.example/", BackupRegistry: tarballServer.URL + "/", Token: "secret"}, "Bearer secret"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reg := &NpmRegistry{NpmRegistryConfig: test.registry}
+			if err := fetchPackageTarballContext(context.Background(), reg, t.TempDir(), "test-package", tarballServer.URL+"/test-package.tgz"); err != nil {
+				t.Fatal(err)
+			}
+			if got := <-authorization; got != test.want {
+				t.Fatalf("expected Authorization header %q, got %q", test.want, got)
+			}
+		})
+	}
+
+	redirectAuthorization := make(chan string, 1)
+	crossOriginServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectAuthorization <- r.Header.Get("Authorization")
+		_, _ = w.Write(tarball.Bytes())
+	}))
+	defer crossOriginServer.Close()
+	registryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, crossOriginServer.URL+"/test-package.tgz", http.StatusFound)
+	}))
+	defer registryServer.Close()
+
+	reg := &NpmRegistry{NpmRegistryConfig: NpmRegistryConfig{Registry: registryServer.URL + "/", Token: "secret"}}
+	if err := fetchPackageTarballContext(context.Background(), reg, t.TempDir(), "test-package", registryServer.URL+"/test-package.tgz"); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-redirectAuthorization; got != "" {
+		t.Fatalf("expected redirect to strip Authorization header, got %q", got)
+	}
+}
+
+func TestFetchPackageTarballBackup(t *testing.T) {
+	var tarball bytes.Buffer
+	gw := gzip.NewWriter(&tarball)
+	tw := tar.NewWriter(gw)
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name           string
+		primaryStatus  int
+		backupStatus   int
+		rateLimited    bool
+		redirectBackup bool
+		wantRequests   []string
+		wantErr        bool
+	}{
+		{"primary succeeds", 200, 200, false, false, []string{"primary Bearer secret"}, false},
+		{"first rate limit", 429, 200, false, false, []string{"primary Bearer secret", "backup Bearer secret"}, false},
+		{"already rate limited", 429, 200, true, false, []string{"backup Bearer secret"}, false},
+		{"backup rate limited", 429, 429, false, false, []string{"primary Bearer secret", "backup Bearer secret"}, true},
+		{"backup redirects to untrusted origin", 429, 200, false, true, []string{"primary Bearer secret", "backup Bearer secret", "external "}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requests := make(chan string, 16)
+			external := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests <- "external " + r.Header.Get("Authorization")
+				_, _ = w.Write(tarball.Bytes())
+			}))
+			defer external.Close()
+			backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests <- "backup " + r.Header.Get("Authorization")
+				if r.URL.RequestURI() != "/test-package.tgz?download=1" {
+					t.Errorf("backup request lost path or query: %s", r.URL)
+				}
+				if test.redirectBackup {
+					http.Redirect(w, r, external.URL+"/test-package.tgz", http.StatusFound)
+					return
+				}
+				w.WriteHeader(test.backupStatus)
+				_, _ = w.Write(tarball.Bytes())
+			}))
+			defer backup.Close()
+			primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests <- "primary " + r.Header.Get("Authorization")
+				w.WriteHeader(test.primaryStatus)
+				_, _ = w.Write(tarball.Bytes())
+			}))
+			defer primary.Close()
+			reg := &NpmRegistry{NpmRegistryConfig: NpmRegistryConfig{
+				Registry: primary.URL + "/", BackupRegistry: backup.URL + "/", Token: "secret",
+			}}
+			if test.rateLimited {
+				reg.rateLimited.Store(1)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := fetchPackageTarballContext(ctx, reg, t.TempDir(), "test-package", primary.URL+"/test-package.tgz?download=1")
+			if (err != nil) != test.wantErr {
+				t.Fatalf("fetchPackageTarballContext() = %v; want error: %v", err, test.wantErr)
+			}
+			if test.primaryStatus == 429 && !reg.isRateLimited() {
+				t.Fatal("registry rate limit was not recorded")
+			}
+			got := make([]string, 0, len(requests))
+			for len(requests) > 0 {
+				got = append(got, <-requests)
+			}
+			if !slices.Equal(got, test.wantRequests) {
+				t.Fatalf("requests = %q; want %q", got, test.wantRequests)
+			}
+		})
+	}
+}
+
+func TestExtractPackageTarball(t *testing.T) {
+	b := make([]byte, 16)
+	rand.Read(b)
+	installDir := filepath.Join(os.TempDir(), hex.EncodeToString(b))
+	defer os.RemoveAll(installDir)
+
+	// Create a malicious tarball with path traversal
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+
+	// Add a normal file
+	content := []byte("export const foo = 'bar';")
+	header := &tar.Header{
+		Name:     "package/index.js",
+		Mode:     0644,
+		Size:     int64(len(content)),
+		Typeflag: tar.TypeReg,
+	}
+	if err := tw.WriteHeader(header); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(content); err != nil {
+		t.Fatal(err)
+	}
+
+	// Add a large file
+	largeContent := make([]byte, 1024*1024*51)
+	rand.Read(largeContent)
+	header = &tar.Header{
+		Name:     "package/large.txt",
+		Mode:     0644,
+		Size:     int64(len(largeContent)),
+		Typeflag: tar.TypeReg,
+	}
+	if err := tw.WriteHeader(header); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(largeContent); err != nil {
+		t.Fatal(err)
+	}
+
+	// add a link
+	header = &tar.Header{
+		Name:     "package/passwd.txt",
+		Mode:     0644,
+		Typeflag: tar.TypeLink,
+		Linkname: "/etc/passwd",
+	}
+	if err := tw.WriteHeader(header); err != nil {
+		t.Fatal(err)
+	}
+
+	// Add a malicious file with path traversal
+	bad := []byte("bad")
+	header = &tar.Header{
+		Name:     "/../../../bad/bad.txt",
+		Mode:     0644,
+		Size:     int64(len(bad)),
+		Typeflag: tar.TypeReg,
+	}
+	if err := tw.WriteHeader(header); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(bad); err != nil {
+		t.Fatal(err)
+	}
+
+	tw.Close()
+	gw.Close()
+
+	// Call extractPackageTarball with the malicious tarball
+	if err := extractPackageTarball(installDir, "test-package", bytes.NewReader(buf.Bytes())); err != nil {
+		t.Errorf("extractPackageTarball returned error: %v", err)
+	}
+	if !existsFile(filepath.Join(installDir, "node_modules", "test-package", "index.js")) {
+		t.Fatal("index.js should be extracted")
+	}
+	if existsFile(filepath.Join(installDir, "node_modules", "test-package", "large.txt")) {
+		t.Fatal("large.txt should not be extracted")
+	}
+	if existsFile(filepath.Join(installDir, "node_modules", "test-package", "passwd.txt")) {
+		t.Fatal("passwd.txt should not be extracted")
+	}
+	if !existsFile(filepath.Join(installDir, "node_modules", "test-package", "bad.txt")) {
+		t.Fatal("bad.txt should be extracted in the root directory")
+	}
+}
+
+func TestExtractPackageTarballRejectsEscapingPackageName(t *testing.T) {
+	if err := extractPackageTarball(t.TempDir(), "../escape", bytes.NewReader(nil)); err == nil {
+		t.Fatal("expected an invalid package name error")
+	}
+}
+
+func TestExtractPackageTarballWillNotWriteThroughSymlink(t *testing.T) {
+	installDir := t.TempDir()
+	destination := t.TempDir()
+	if err := os.Mkdir(filepath.Join(installDir, "node_modules"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(destination, filepath.Join(installDir, "node_modules", "test-package")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+	content := []byte("export const escaped = true")
+	if err := tw.WriteHeader(&tar.Header{Name: "package/index.js", Mode: 0644, Size: int64(len(content)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := extractPackageTarball(installDir, "test-package", bytes.NewReader(buf.Bytes())); err == nil {
+		t.Fatal("expected extraction through a symlink to fail")
+	}
+	if existsFile(filepath.Join(destination, "index.js")) {
+		t.Fatal("tarball escaped the extraction root")
+	}
+}

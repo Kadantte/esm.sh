@@ -3,170 +3,225 @@ package server
 import (
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path"
+	"strings"
 	"syscall"
+	"time"
 
-	"github.com/esm-dev/esm.sh/server/storage"
-
-	logger "github.com/ije/gox/log"
-	"github.com/ije/rex"
+	"github.com/esm-dev/esm.sh/internal/storage"
+	"github.com/ije/gox/log"
+	"github.com/ije/gox/set"
+	"golang.org/x/crypto/acme/autocert"
 )
 
-var (
-	buildQueue *BuildQueue
-	config     *Config
-	cache      storage.Cache
-	db         storage.DataBase
-	fs         storage.FileSystem
-	log        *logger.Logger
-)
-
-// Serve serves the esm.sh server
-func Serve(efs EmbedFS) {
-	var (
-		cfile string
-		debug bool
-		err   error
-	)
+// Start starts the esm.sh server
+func Start() {
+	var cfile string
+	var err error
 
 	flag.StringVar(&cfile, "config", "config.json", "the config file path")
-	flag.BoolVar(&debug, "debug", false, "to run server in DEUBG mode")
 	flag.Parse()
 
-	if !existsFile(cfile) {
-		config = DefaultConfig()
-		if cfile != "config.json" {
-			fmt.Println("Config file not found, use default config")
-		}
-	} else {
+	if existsFile(cfile) {
 		config, err = LoadConfig(cfile)
 		if err != nil {
 			fmt.Println(err.Error())
 			os.Exit(1)
 		}
-		if debug {
-			fmt.Println("Config loaded from", cfile)
+		if DEBUG {
+			fmt.Printf("%s [info] Config loaded from %s\n", time.Now().Format("2006-01-02 15:04:05"), cfile)
 		}
 	}
-	buildQueue = NewBuildQueue(int(config.BuildConcurrency))
 
-	if debug {
+	if DEBUG {
 		config.LogLevel = "debug"
-		cwd, err := os.Getwd()
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
-		embedFS = &MockEmbedFS{cwd}
 	} else {
-		os.Setenv("NO_COLOR", "1") // disable log color in production
-		embedFS = efs
+		// disable log color in release build
+		os.Setenv("NO_COLOR", "1")
 	}
 
-	log, err = logger.New(fmt.Sprintf("file:%s?buffer=32k", path.Join(config.LogDir, fmt.Sprintf("main-v%d.log", VERSION))))
+	logger, err := log.New(fmt.Sprintf("file:%s?buffer=64k&fileDateFormat=20060102&term", path.Join(config.LogDir, "server.log")))
 	if err != nil {
-		fmt.Printf("initiate logger: %v\n", err)
+		fmt.Println("failed to initialize logger:", err)
 		os.Exit(1)
 	}
-	log.SetLevelByName(config.LogLevel)
+	if os.Getenv("ESMDIR") != "" {
+		logger.Term(false)
+	}
+	logger.SetLevelByName(config.LogLevel)
 
-	cache, err = storage.OpenCache(config.Cache)
+	accessLogger, err := log.New(fmt.Sprintf("file:%s?buffer=1m&fileDateFormat=20060102", path.Join(config.LogDir, "access.log")))
 	if err != nil {
-		log.Fatalf("init cache(%s): %v", config.Cache, err)
+		logger.Fatalf("failed to initialize access logger: %v", err)
 	}
 
-	fs, err = storage.OpenFS(config.Storage)
+	// initialize storage
+	esmStorage, err := storage.New(&config.Storage)
 	if err != nil {
-		log.Fatalf("init fs(%s): %v", config.Storage, err)
+		logger.Fatalf("failed to initialize storage(%s): %v", config.Storage.Type, err)
 	}
+	logger.Debugf("storage initialized, type: %s, endpoint: %s", config.Storage.Type, config.Storage.Endpoint)
 
-	db, err = storage.OpenDB(config.Database)
-	if err != nil {
-		log.Fatalf("init db(%s): %v", config.Database, err)
+	// load node runtime in background
+	go getNodeRuntimeJS("fs")
+
+	// build the handler chain, the last added handler is called first
+	var handler http.Handler = esmRouter(esmStorage, logger)
+	handler = esmLegacyRouter(esmStorage, handler)
+	if config.CustomLandingPage.Origin != "" {
+		handler = customLandingPage(&config.CustomLandingPage, handler)
 	}
-
-	err = loadNodeLibs(efs)
-	if err != nil {
-		log.Fatalf("load node libs: %v", err)
+	if config.Compress {
+		handler = withCompress(handler)
 	}
-	log.Debugf("%d node libs loaded", len(nodeLibs))
-
-	err = loadNpmPolyfills(efs)
-	if err != nil {
-		log.Fatalf("load npm polyfills: %v", err)
+	if config.AccessLog {
+		handler = withAccessLog(accessLogger, handler)
 	}
-	log.Debugf("%d npm polyfills loaded", len(npmPolyfills))
+	handler = corsMiddleware(config.CorsAllowOrigins, handler)
+	handler = pprofRouter(handler)
+	handler = withRecovery(logger, handler)
 
-	var accessLogger *logger.Logger
-	if config.LogDir == "" {
-		accessLogger = &logger.Logger{}
-	} else {
-		accessLogger, err = logger.New(fmt.Sprintf("file:%s?buffer=32k&fileDateFormat=20060102", path.Join(config.LogDir, "access.log")))
-		if err != nil {
-			log.Fatalf("failed to initialize access logger: %v", err)
+	// start the http server
+	errCh := make(chan error, 2)
+	httpServer := &http.Server{
+		Addr:    fmt.Sprintf(":%d", config.Port),
+		Handler: handler,
+	}
+	go func() {
+		errCh <- httpServer.ListenAndServe()
+	}()
+	logger.Infof("Server is ready on http://localhost:%d", config.Port)
+
+	// start the https server with autocert (Let's Encrypt) if the `tlsPort` is set
+	if config.TlsPort > 0 && !DEBUG {
+		cdnURL, err := url.Parse(config.CdnOrigin)
+		if err != nil || cdnURL.Hostname() == "" {
+			logger.Fatal("cdnOrigin is required when tlsPort is enabled")
 		}
+		certManager := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			Cache:      autocert.DirCache(path.Join(config.WorkDir, "autotls")),
+			HostPolicy: autocert.HostWhitelist(cdnURL.Hostname()),
+		}
+		httpsServer := &http.Server{
+			Addr:      fmt.Sprintf(":%d", config.TlsPort),
+			Handler:   handler,
+			TLSConfig: certManager.TLSConfig(),
+		}
+		go func() {
+			errCh <- httpsServer.ListenAndServeTLS("", "")
+		}()
+		logger.Infof("Server is ready on https://localhost:%d", config.TlsPort)
 	}
-	accessLogger.SetQuite(true) // quite in terminal
-
-	nodejsInstallDir := os.Getenv("NODE_INSTALL_DIR")
-	if nodejsInstallDir == "" {
-		nodejsInstallDir = path.Join(config.WorkDir, "nodejs")
-	}
-	nodeVer, pnpmVer, err := checkNodejs(nodejsInstallDir)
-	if err != nil {
-		log.Fatalf("nodejs: %v", err)
-	}
-	log.Debugf("nodejs: v%s, pnpm: %s, registry: %s", nodeVer, pnpmVer, config.NpmRegistry)
-
-	err = initCJSLexerNodeApp()
-	if err != nil {
-		log.Fatalf("failed to initialize the cjs_lexer node app: %v", err)
-	}
-	log.Debugf("%s initialized", cjsLexerPkg)
-
-	if !config.DisableCompression {
-		rex.Use(rex.Compression())
-	}
-	rex.Use(
-		rex.ErrorLogger(log),
-		rex.AccessLogger(accessLogger),
-		rex.Header("Server", "esm.sh"),
-		rex.Cors(rex.CORS{
-			AllowedOrigins:   []string{"*"},
-			AllowedMethods:   []string{"HEAD", "GET", "POST"},
-			ExposedHeaders:   []string{"ETag", "X-ESM-Path", "X-TypeScript-Types"},
-			MaxAge:           86400, // 24 hours
-			AllowCredentials: false,
-		}),
-		auth(config.AuthSecret),
-		router(),
-	)
-
-	C := rex.Serve(rex.ServerConfig{
-		Port: uint16(config.Port),
-		TLS: rex.TLSConfig{
-			Port: uint16(config.TlsPort),
-			AutoTLS: rex.AutoTLSConfig{
-				AcceptTOS: config.TlsPort > 0 && !debug,
-				CacheDir:  path.Join(config.WorkDir, "autotls"),
-			},
-		},
-	})
-
-	log.Infof("Server is ready on http://localhost:%d", config.Port)
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGHUP, syscall.SIGABRT)
 	select {
 	case <-c:
-	case err = <-C:
-		log.Error(err)
+	case err = <-errCh:
+		logger.Error(err)
 	}
 
 	// release resources
-	db.Close()
-	log.FlushBuffer()
+	logger.FlushBuffer()
 	accessLogger.FlushBuffer()
+}
+
+// corsMiddleware returns a middleware that handles CORS requests.
+func corsMiddleware(allowOrigins []string, next http.Handler) http.Handler {
+	allowList := set.NewReadOnly(allowOrigins...)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		isOptions := r.Method == http.MethodOptions
+		h := w.Header()
+		if allowList.Len() > 0 {
+			if origin != "" {
+				if !allowList.Has(origin) {
+					writeStatus(w, http.StatusForbidden, "forbidden")
+					return
+				}
+				h.Set("Access-Control-Allow-Origin", origin)
+			} else if isOptions {
+				writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
+				return
+			}
+			appendVaryHeader(h, "Origin")
+		} else {
+			h.Set("Access-Control-Allow-Origin", "*")
+		}
+		if isOptions {
+			h.Set("Access-Control-Allow-Headers", "*")
+			h.Set("Access-Control-Max-Age", "86400")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// customLandingPage returns a middleware that serves the custom landing page
+// from the configured origin.
+func customLandingPage(options *LandingPageOptions, next http.Handler) http.Handler {
+	assets := set.New[string]()
+	for _, p := range options.Assets {
+		assets.Add("/" + strings.TrimPrefix(p, "/"))
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" && !assets.Has(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		query := r.URL.RawQuery
+		if query != "" {
+			query = "?" + query
+		}
+		url, err := r.URL.Parse(options.Origin + r.URL.Path + query)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "Invalid url")
+			return
+		}
+		fetchClient := newFetchClient(r.UserAgent(), 15)
+		res, err := fetchClient.Fetch(url, nil)
+		if err != nil {
+			writeJSONError(w, http.StatusBadGateway, "Failed to fetch custom landing page")
+			return
+		}
+		defer res.Body.Close()
+		h := w.Header()
+		etag := res.Header.Get("Etag")
+		if etag != "" {
+			if res.StatusCode == http.StatusOK && r.Header.Get("If-None-Match") == etag {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			h.Set("Etag", etag)
+		} else {
+			lastModified := res.Header.Get("Last-Modified")
+			if lastModified != "" {
+				v := r.Header.Get("If-Modified-Since")
+				if res.StatusCode == http.StatusOK && v != "" {
+					timeIfModifiedSince, e1 := time.Parse(http.TimeFormat, v)
+					timeLastModified, e2 := time.Parse(http.TimeFormat, lastModified)
+					if e1 == nil && e2 == nil && !timeLastModified.After(timeIfModifiedSince) {
+						w.WriteHeader(http.StatusNotModified)
+						return
+					}
+				}
+				h.Set("Last-Modified", lastModified)
+			}
+		}
+		cacheControl := res.Header.Get("Cache-Control")
+		if cacheControl == "" {
+			cacheControl = ccMustRevalidate
+		}
+		h.Set("Cache-Control", cacheControl)
+		h.Set("Content-Type", res.Header.Get("Content-Type"))
+		w.WriteHeader(res.StatusCode)
+		io.Copy(w, res.Body)
+	})
 }

@@ -1,38 +1,83 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/netip"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
+
+	"github.com/esm-dev/esm.sh/internal/storage"
+	"github.com/ije/gox/term"
+	"github.com/ije/gox/utils"
+)
+
+var (
+	// global config
+	config *Config
 )
 
 // Config represents the configuration of esm.sh server.
 type Config struct {
-	Port               uint16                 `json:"port"`
-	TlsPort            uint16                 `json:"tlsPort"`
-	WorkDir            string                 `json:"workDir"`
-	AuthSecret         string                 `json:"authSecret"`
-	AllowList          AllowList              `json:"allowList"`
-	BanList            BanList                `json:"banList"`
-	BuildConcurrency   uint16                 `json:"buildConcurrency"`
-	BuildTimeout       uint16                 `json:"buildTimeout"`
-	Minify             json.RawMessage        `json:"minify"`
-	DisableSourceMap   bool                   `json:"disableSourceMap"`
-	DisableCompression bool                   `json:"disableCompression"`
-	Cache              string                 `json:"cache"`
-	Storage            string                 `json:"storage"`
-	Database           string                 `json:"database"`
-	LogDir             string                 `json:"logDir"`
-	LogLevel           string                 `json:"logLevel"`
-	NpmRegistry        string                 `json:"npmRegistry"`
-	NpmToken           string                 `json:"npmToken"`
-	NpmUser            string                 `json:"npmUser"`
-	NpmPassword        string                 `json:"npmPassword"`
-	NpmRegistries      map[string]NpmRegistry `json:"npmRegistries"`
+	Port                uint16                       `json:"port"`
+	TlsPort             uint16                       `json:"tlsPort"`
+	CdnOrigin           string                       `json:"cdnOrigin"`
+	CustomLandingPage   LandingPageOptions           `json:"customLandingPage"`
+	WorkDir             string                       `json:"workDir"`
+	CorsAllowOrigins    []string                     `json:"corsAllowOrigins"`
+	TrustedProxies      []netip.Prefix               `json:"trustedProxies"`
+	AllowList           AllowList                    `json:"allowList"`
+	BanList             BanList                      `json:"banList"`
+	BuildConcurrency    uint16                       `json:"buildConcurrency"`
+	BuildWaitTime       uint16                       `json:"buildWaitTime"`
+	BuildTimeout        uint16                       `json:"buildTimeout"`
+	Storage             storage.StorageOptions       `json:"storage"`
+	LogDir              string                       `json:"logDir"`
+	LogLevel            string                       `json:"logLevel"`
+	AccessLog           bool                         `json:"accessLog"`
+	NpmRegistry         string                       `json:"npmRegistry"`
+	NpmBackupRegistry   string                       `json:"npmBackupRegistry"`
+	NpmToken            string                       `json:"npmToken"`
+	NpmUser             string                       `json:"npmUser"`
+	NpmPassword         string                       `json:"npmPassword"`
+	NpmScopedRegistries map[string]NpmRegistryConfig `json:"npmScopedRegistries"`
+	NpmQueryCacheTTL    uint32                       `json:"npmQueryCacheTTL"`
+	PurgeAPI            PurgeAPIConfig               `json:"purgeAPI"`
+	MinifyRaw           json.RawMessage              `json:"minify"`
+	SourceMapRaw        json.RawMessage              `json:"sourceMap"`
+	CompressRaw         json.RawMessage              `json:"compress"`
+	Minify              bool                         `json:"-"`
+	SourceMap           bool                         `json:"-"`
+	Compress            bool                         `json:"-"`
+}
+
+type PurgeAPIConfig struct {
+	EnableRaw          json.RawMessage `json:"enable"`
+	GithubClientID     string          `json:"githubClientId"`
+	GithubClientSecret string          `json:"githubClientSecret"`
+	CloudflareZoneID   string          `json:"cloudflareZoneId"`
+	CloudflareAPIToken string          `json:"cloudflareApiToken"`
+	Enable             bool            `json:"-"`
+}
+
+type NpmRegistryConfig struct {
+	Registry       string `json:"registry"`
+	BackupRegistry string `json:"backupRegistry"`
+	Token          string `json:"token"`
+	User           string `json:"user"`
+	Password       string `json:"password"`
+}
+
+type LandingPageOptions struct {
+	Origin string   `json:"origin"`
+	Assets []string `json:"assets"`
 }
 
 type BanList struct {
@@ -46,200 +91,280 @@ type BanScope struct {
 }
 
 type AllowList struct {
-	Packages []string     `json:"packages"`
-	Scopes   []AllowScope `json:"scopes"`
-}
-
-type AllowScope struct {
-	Name string `json:"name"`
+	Packages []string `json:"packages"`
+	Scopes   []string `json:"scopes"`
 }
 
 // LoadConfig loads config from the given file. Panic if failed to load.
-func LoadConfig(filename string) (cfg *Config, err error) {
+func LoadConfig(filename string) (*Config, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, fmt.Errorf("fail to read config file: %w", err)
 	}
 	defer file.Close()
 
-	err = json.NewDecoder(file).Decode(&cfg)
+	var config Config
+	err = json.NewDecoder(file).Decode(&config)
 	if err != nil {
 		return nil, fmt.Errorf("fail to parse config: %w", err)
 	}
-
-	// ensure `workDir`
-	if cfg.WorkDir == "" {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("fail to get current user home directory: %w", err)
-		}
-		cfg.WorkDir = path.Join(homeDir, ".esmd")
-	} else {
-		cfg.WorkDir, err = filepath.Abs(cfg.WorkDir)
+	if config.WorkDir != "" && !filepath.IsAbs(config.WorkDir) {
+		config.WorkDir, err = filepath.Abs(config.WorkDir)
 		if err != nil {
 			return nil, fmt.Errorf("fail to get absolute path of the work directory: %w", err)
 		}
 	}
-	return fixConfig(cfg), nil
+	normalizeConfig(&config)
+	return &config, nil
 }
 
 func DefaultConfig() *Config {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		panic(err)
-	}
-	return fixConfig(&Config{
-		WorkDir: path.Join(homeDir, ".esmd"),
-	})
+	config := &Config{}
+	normalizeConfig(config)
+	return config
 }
 
-func fixConfig(c *Config) *Config {
-	if c.Port == 0 {
-		c.Port = 8080
+func normalizeConfig(config *Config) {
+	if config.Port == 0 {
+		config.Port = 80
 	}
-	if c.AuthSecret == "" {
-		c.AuthSecret = os.Getenv("AUTH_SECRET")
+	if config.CdnOrigin == "" {
+		config.CdnOrigin = os.Getenv("CDN_ORIGIN")
 	}
-	if !c.DisableCompression {
-		c.DisableCompression = os.Getenv("DISABLE_COMPRESSION") == "true"
-	}
-	if !c.DisableSourceMap {
-		c.DisableSourceMap = os.Getenv("DISABLE_SOURCEMAP") == "true"
-	}
-	if c.Minify == nil && os.Getenv("MINIFY") == "false" {
-		c.Minify = []byte("false")
-	}
-	if c.BuildConcurrency == 0 {
-		c.BuildConcurrency = uint16(runtime.NumCPU())
-	}
-	if c.BuildTimeout == 0 {
-		c.BuildTimeout = 30 // seconds
-	}
-	if c.Cache == "" {
-		c.Cache = "memory:default"
-	}
-	if c.Database == "" {
-		c.Database = fmt.Sprintf("bolt:%s", path.Join(c.WorkDir, "esm.db"))
-	}
-	if c.Storage == "" {
-		c.Storage = fmt.Sprintf("local:%s", path.Join(c.WorkDir, "storage"))
-	}
-	if c.LogDir == "" {
-		c.LogDir = path.Join(c.WorkDir, "log")
-	}
-	if c.LogLevel == "" {
-		c.LogLevel = os.Getenv("LOG_LEVEL")
-		if c.LogLevel == "" {
-			c.LogLevel = "info"
+	if origin := config.CdnOrigin; origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			fmt.Println(term.Red("[error] invalid cdn origin: " + origin))
+			config.CdnOrigin = ""
+		} else {
+			config.CdnOrigin = u.Scheme + "://" + u.Host
 		}
 	}
-	if c.NpmRegistry != "" {
-		if isHttpSepcifier(c.NpmRegistry) {
-			c.NpmRegistry = strings.TrimRight(c.NpmRegistry, "/") + "/"
+	if config.WorkDir == "" {
+		if v := os.Getenv("ESMDIR"); v != "" && existsDir(v) {
+			config.WorkDir = v
+		} else {
+			homeDir, err := os.UserHomeDir()
+			if err != nil {
+				homeDir = "/home"
+			}
+			config.WorkDir = path.Join(homeDir, ".esmd")
+		}
+	}
+	if v := os.Getenv("CORS_ALLOW_ORIGINS"); v != "" {
+		for p := range strings.SplitSeq(v, ",") {
+			orig := strings.TrimSpace(p)
+			if orig != "" {
+				u, e := url.Parse(orig)
+				if e == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
+					config.CorsAllowOrigins = append(config.CorsAllowOrigins, u.Scheme+"://"+u.Host)
+				}
+			}
+		}
+	}
+	if config.CustomLandingPage.Origin == "" {
+		v := os.Getenv("CUSTOM_LANDING_PAGE_ORIGIN")
+		if v != "" {
+			config.CustomLandingPage.Origin = v
+			if v := os.Getenv("CUSTOM_LANDING_PAGE_ASSETS"); v != "" {
+				a := strings.SplitSeq(v, ",")
+				for p := range a {
+					p = strings.TrimSpace(p)
+					if p != "" {
+						config.CustomLandingPage.Assets = append(config.CustomLandingPage.Assets, p)
+					}
+				}
+			}
+		}
+	}
+	if origin := config.CustomLandingPage.Origin; origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+			fmt.Println(term.Red("[error] invalid custom landing page origin: " + origin))
+			config.CustomLandingPage = LandingPageOptions{}
+		} else {
+			config.CustomLandingPage.Origin = u.Scheme + "://" + u.Host
+		}
+	}
+	if config.BuildConcurrency == 0 {
+		config.BuildConcurrency = uint16(runtime.NumCPU())
+	}
+	if config.BuildWaitTime == 0 {
+		config.BuildWaitTime = 30 // seconds
+	}
+	if config.BuildTimeout == 0 {
+		config.BuildTimeout = 600 // seconds
+	}
+	if config.Storage.Type == "" {
+		storageType := os.Getenv("STORAGE_TYPE")
+		if storageType == "" {
+			storageType = "fs"
+		}
+		config.Storage.Type = storageType
+	}
+	if config.Storage.Endpoint == "" {
+		storageEndpint := os.Getenv("STORAGE_ENDPOINT")
+		if storageEndpint == "" {
+			storageEndpint = path.Join(config.WorkDir, "storage")
+		}
+		config.Storage.Endpoint = storageEndpint
+	}
+	if config.Storage.Region == "" {
+		config.Storage.Region = os.Getenv("STORAGE_REGION")
+	}
+	if config.Storage.AccessKeyID == "" {
+		config.Storage.AccessKeyID = os.Getenv("STORAGE_ACCESS_KEY_ID")
+	}
+	if config.Storage.SecretAccessKey == "" {
+		config.Storage.SecretAccessKey = os.Getenv("STORAGE_SECRET_ACCESS_KEY")
+	}
+	if config.LogDir == "" {
+		config.LogDir = path.Join(config.WorkDir, "log")
+	}
+	if config.LogLevel == "" {
+		config.LogLevel = os.Getenv("LOG_LEVEL")
+		if config.LogLevel == "" {
+			config.LogLevel = "info"
+		}
+	}
+	if !config.AccessLog {
+		config.AccessLog = os.Getenv("ACCESS_LOG") == "true"
+	}
+	if config.NpmRegistry != "" {
+		if isHttpSpecifier(config.NpmRegistry) {
+			config.NpmRegistry = strings.TrimRight(config.NpmRegistry, "/") + "/"
 		}
 	} else {
 		v := os.Getenv("NPM_REGISTRY")
-		if v != "" && isHttpSepcifier(v) {
-			c.NpmRegistry = strings.TrimRight(v, "/") + "/"
+		if v != "" && isHttpSpecifier(v) {
+			config.NpmRegistry = strings.TrimRight(v, "/") + "/"
 		} else {
-			c.NpmRegistry = npmRegistry
+			config.NpmRegistry = npmRegistry
 		}
 	}
-	if c.NpmToken == "" {
-		c.NpmToken = os.Getenv("NPM_TOKEN")
+	if config.NpmBackupRegistry != "" && config.NpmBackupRegistry == config.NpmRegistry {
+		fmt.Println(term.Red("[error] npm backup registry cannot be the same as the npm registry"))
+		config.NpmBackupRegistry = ""
 	}
-	if c.NpmUser == "" {
-		c.NpmUser = os.Getenv("NPM_USER")
+	if config.NpmToken == "" {
+		config.NpmToken = os.Getenv("NPM_TOKEN")
 	}
-	if c.NpmPassword == "" {
-		c.NpmPassword = os.Getenv("NPM_PASSWORD")
+	if config.NpmUser == "" {
+		config.NpmUser = os.Getenv("NPM_USER")
 	}
-	if len(c.NpmRegistries) > 0 {
-		regs := make(map[string]NpmRegistry)
-		for scope, rc := range c.NpmRegistries {
-			if strings.HasPrefix(scope, "@") && isHttpSepcifier(rc.Registry) {
+	if config.NpmPassword == "" {
+		config.NpmPassword = os.Getenv("NPM_PASSWORD")
+	}
+	if len(config.NpmScopedRegistries) > 0 {
+		regs := make(map[string]NpmRegistryConfig)
+		for scope, rc := range config.NpmScopedRegistries {
+			if strings.HasPrefix(scope, "@") && isHttpSpecifier(rc.Registry) {
 				rc.Registry = strings.TrimRight(rc.Registry, "/") + "/"
 				regs[scope] = rc
 			} else {
 				fmt.Printf("[error] invalid npm registry for scope %s: %s\n", scope, rc.Registry)
 			}
 		}
-		c.NpmRegistries = regs
+		config.NpmScopedRegistries = regs
 	}
-	return c
+	if config.NpmQueryCacheTTL == 0 {
+		config.NpmQueryCacheTTL = 600
+		if v := os.Getenv("NPM_QUERY_CACHE_TTL"); v != "" {
+			if i, err := strconv.ParseUint(v, 10, 32); err == nil {
+				config.NpmQueryCacheTTL = uint32(i)
+			}
+		}
+	}
+	purgeAPI := &config.PurgeAPI
+	purgeAPI.Enable = !(bytes.Equal(purgeAPI.EnableRaw, []byte("false")) || os.Getenv("PURGE_CACHE") == "false")
+	if purgeAPI.GithubClientID == "" {
+		purgeAPI.GithubClientID = os.Getenv("PURGE_GITHUB_CLIENT_ID")
+	}
+	if purgeAPI.GithubClientSecret == "" {
+		purgeAPI.GithubClientSecret = os.Getenv("PURGE_GITHUB_CLIENT_SECRET")
+	}
+	if purgeAPI.CloudflareZoneID == "" {
+		purgeAPI.CloudflareZoneID = os.Getenv("PURGE_CLOUDFLARE_ZONE_ID")
+	}
+	if purgeAPI.CloudflareAPIToken == "" {
+		purgeAPI.CloudflareAPIToken = os.Getenv("PURGE_CLOUDFLARE_API_TOKEN")
+	}
+	config.Compress = !(bytes.Equal(config.CompressRaw, []byte("false")) || os.Getenv("COMPRESS") == "false")
+	config.SourceMap = !(bytes.Equal(config.SourceMapRaw, []byte("false")) || (os.Getenv("SOURCEMAP") == "false" || os.Getenv("SOURCE_MAP") == "false"))
+	config.Minify = !(bytes.Equal(config.MinifyRaw, []byte("false")) || os.Getenv("MINIFY") == "false")
 }
 
 // extractPackageName Will take a packageName as input extract key parts and return them
 //
-// fullNameWithoutVersion  e.g. @github/faker
-// scope                   e.g. @github
-// nameWithoutVersionScope e.g. faker
-func extractPackageName(packageName string) (fullNameWithoutVersion string, scope string, nameWithoutVersionScope string) {
-	paths := strings.Split(packageName, "/")
-	if strings.HasPrefix(packageName, "@") {
+// moduleName        e.g. @github/faker[@1.0.0]/submodule
+// packageId         e.g. @github/faker[@1.0.0]
+// scope             e.g. @github
+// name              e.g. faker
+// version           e.g. [@1.0.0]
+func extractPackageName(moduleName string) (packageId string, scope string, name string, version string) {
+	paths := strings.Split(moduleName, "/")
+	if strings.HasPrefix(moduleName, "@") && len(paths) > 1 {
+		packageId = paths[0] + "/" + paths[1]
 		scope = paths[0]
-		nameWithoutVersionScope = strings.Split(paths[1], "@")[0]
-		fullNameWithoutVersion = fmt.Sprintf("%s/%s", scope, nameWithoutVersionScope)
+		name, version = utils.SplitByFirstByte(paths[1], '@')
 	} else {
 		// the package has no scope prefix
-		nameWithoutVersionScope = strings.Split(paths[0], "@")[0]
-		fullNameWithoutVersion = nameWithoutVersionScope
+		packageId = paths[0]
+		name, version = utils.SplitByFirstByte(packageId, '@')
 	}
-
-	return fullNameWithoutVersion, scope, nameWithoutVersionScope
+	return
 }
 
-// IsPackageBanned Checking if the package is banned.
-// The `packages` list is the highest priority ban rule to match,
-// so the `excludes` list in the `scopes` list won't take effect if the package is banned in `packages` list
-func (banList *BanList) IsPackageBanned(fullName string) bool {
-	fullNameWithoutVersion, scope, nameWithoutVersionScope := extractPackageName(fullName)
-
-	for _, p := range banList.Packages {
-		if fullNameWithoutVersion == p {
-			return true
-		}
-	}
-
-	for _, s := range banList.Scopes {
-		if scope == s.Name {
-			return !isPackageExcluded(nameWithoutVersionScope, s.Excludes)
-		}
-	}
-
-	return false
+func (allowList *AllowList) IsEmpty() bool {
+	return len(allowList.Packages) == 0 && len(allowList.Scopes) == 0
 }
 
 // IsPackageAllowed Checking if the package is allowed.
 // The `packages` list is the highest priority allow rule to match,
 // so the `includes` list in the `scopes` list won't take effect if the package is allowed in `packages` list
-func (allowList *AllowList) IsPackageAllowed(fullName string) bool {
-	if len(allowList.Packages) == 0 && len(allowList.Scopes) == 0 {
+func (allowList *AllowList) IsPackageAllowed(moduleName string) bool {
+	if allowList.IsEmpty() {
 		return true
 	}
 
-	fullNameWithoutVersion, scope, _ := extractPackageName(fullName)
+	packageId, scope, name, _ := extractPackageName(moduleName)
 
-	for _, p := range allowList.Packages {
-		if fullNameWithoutVersion == p {
-			return true
-		}
+	if slices.Contains(allowList.Packages, packageId) || (scope != "" && slices.Contains(allowList.Packages, scope+"/"+name)) || (scope == "" && slices.Contains(allowList.Packages, name)) {
+		return true
 	}
 
-	for _, s := range allowList.Scopes {
-		if scope == s.Name {
-			return true
+	return slices.Contains(allowList.Scopes, scope)
+}
+
+// IsPackageBanned Checking if the package is banned.
+// The `packages` list is the highest priority ban rule to match,
+// so the `excludes` list in the `scopes` list won't take effect if the package is banned in `packages` list
+func (banList *BanList) IsPackageBanned(moduleName string) bool {
+	if banList.IsEmpty() {
+		return false
+	}
+
+	packageId, scope, name, version := extractPackageName(moduleName)
+
+	if slices.Contains(banList.Packages, packageId) || (scope != "" && slices.Contains(banList.Packages, scope+"/"+name)) || (scope == "" && slices.Contains(banList.Packages, name)) {
+		return true
+	}
+
+	if scope != "" {
+		for _, s := range banList.Scopes {
+			if scope == s.Name {
+				return !slices.Contains(s.Excludes, name) && !(version != "" && slices.Contains(s.Excludes, name+"@"+version))
+			}
 		}
 	}
 
 	return false
 }
 
-func isPackageExcluded(name string, excludes []string) bool {
-	for _, exclude := range excludes {
-		if name == exclude {
-			return true
-		}
-	}
-	return false
+func (banList *BanList) IsEmpty() bool {
+	return len(banList.Packages) == 0 && len(banList.Scopes) == 0
+}
+
+func init() {
+	config = DefaultConfig()
 }

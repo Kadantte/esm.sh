@@ -1,12 +1,16 @@
 package server
 
-// esm.sh version
-const VERSION = 136
+const (
+	MB                    = 1 << 20
+	maxAssetFileSize      = 50 * MB
+	maxPackageTarballSize = 256 * MB
+	lruCacheCapacity      = 10000
+)
 
-// asset extensions
+// asset file extensions
 var assetExts = map[string]bool{
+	"node":       true,
 	"wasm":       true,
-	"css":        true,
 	"less":       true,
 	"sass":       true,
 	"scss":       true,
@@ -21,9 +25,9 @@ var assetExts = map[string]bool{
 	"tmTheme":    true,
 	"yml":        true,
 	"yaml":       true,
-	"pdf":        true,
 	"txt":        true,
 	"glsl":       true,
+	"wgsl":       true,
 	"frag":       true,
 	"vert":       true,
 	"md":         true,
@@ -31,13 +35,12 @@ var assetExts = map[string]bool{
 	"markdown":   true,
 	"html":       true,
 	"htm":        true,
-	"vue":        true,
-	"svelte":     true,
 	"svg":        true,
 	"png":        true,
 	"jpg":        true,
 	"jpeg":       true,
 	"webp":       true,
+	"avif":       true,
 	"gif":        true,
 	"ico":        true,
 	"eot":        true,
@@ -52,14 +55,66 @@ var assetExts = map[string]bool{
 	"oga":        true,
 	"wav":        true,
 	"weba":       true,
-	"mp4":        true,
-	"m4v":        true,
-	"ogv":        true,
-	"webm":       true,
-	"zip":        true,
 	"gz":         true,
-	"tar":        true,
 	"tgz":        true,
+}
+
+// node built-in modules
+var nodeBuiltinModules = map[string]bool{
+	"assert":              true,
+	"assert/strict":       true,
+	"async_hooks":         true,
+	"buffer":              true,
+	"child_process":       true,
+	"cluster":             true,
+	"console":             true,
+	"constants":           true,
+	"crypto":              true,
+	"dgram":               true,
+	"diagnostics_channel": true,
+	"dns":                 true,
+	"dns/promises":        true,
+	"domain":              true,
+	"events":              true,
+	"fs":                  true,
+	"fs/promises":         true,
+	"http":                true,
+	"http2":               true,
+	"https":               true,
+	"inspector":           true,
+	"inspector/promises":  true,
+	"module":              true,
+	"net":                 true,
+	"os":                  true,
+	"path":                true,
+	"path/posix":          true,
+	"path/win32":          true,
+	"perf_hooks":          true,
+	"process":             true,
+	"punycode":            true,
+	"querystring":         true,
+	"readline":            true,
+	"readline/promises":   true,
+	"repl":                true,
+	"stream":              true,
+	"stream/consumers":    true,
+	"stream/promises":     true,
+	"stream/web":          true,
+	"string_decoder":      true,
+	"sys":                 true,
+	"timers":              true,
+	"timers/promises":     true,
+	"tls":                 true,
+	"trace_events":        true,
+	"tty":                 true,
+	"url":                 true,
+	"util":                true,
+	"util/types":          true,
+	"v8":                  true,
+	"vm":                  true,
+	"wasi":                true,
+	"worker_threads":      true,
+	"zlib":                true,
 }
 
 // css packages
@@ -69,4 +124,23 @@ var cssPackages = map[string]string{
 	"normalize.css":    "normalize.css",
 	"modern-normalize": "modern-normalize.css",
 	"reset-css":        "reset.css",
+}
+
+// force to use `npm:` specifier for `denonext` target to support node native module or fix `createRequire` issue
+var forceNpmSpecifiers = map[string]bool{
+	"@achingbrain/ssdp": true,
+	"aws-crt":           true,
+	"default-gateway":   true,
+	"fsevents":          true,
+	"lightningcss":      true,
+	"re2":               true,
+	"zlib-sync":         true,
+	"css-tree":          true,
+}
+
+// packages that are safe to reserve global `process` variable for browser target
+var safeReserveProcessPackages = map[string]bool{
+	"react":      true,
+	"react-dom":  true,
+	"typescript": true,
 }
